@@ -6,6 +6,7 @@ import { user } from "../db/schema/auth.js";
 import { classes, subjects, departments, enrollments, attendance, assignments, announcements, submissions, classGrades } from "../db/schema/app.js";
 import { requireAuth } from "../middleware/require-auth.js";
 import { shortCache } from "../middleware/cache.js";
+import { activePortalClassIds } from "../lib/portal-context.js";
 
 const dashboardRouter = Router();
 
@@ -41,6 +42,11 @@ const pctChange = (current: number, previous: number): number | null => {
 dashboardRouter.get("/stats", requireAuth, async (req, res) => {
     try {
         const isTeacher = req.user?.role === "teacher";
+        const contextClassIds = req.user?.id && (req.user.role === "teacher" || req.user.role === "student")
+            ? await activePortalClassIds({ ...req.user, id: req.user.id })
+            : null;
+        const contextClassScope = contextClassIds ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`) : undefined;
+        const contextAttendanceScope = contextClassIds ? (contextClassIds.length ? inArray(attendance.classId, contextClassIds) : sql`false`) : undefined;
 
         if (isTeacher) {
             const teacherId = req.user!.id!;
@@ -56,12 +62,12 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     .select({ total: countDistinct(enrollments.studentId) })
                     .from(enrollments)
                     .innerJoin(classes, eq(enrollments.classId, classes.id))
-                    .where(eq(classes.teacherId, teacherId)),
-                db.select({ total: count() }).from(classes).where(eq(classes.teacherId, teacherId)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
+                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope)),
                 db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(classes)
-                    .where(eq(classes.teacherId, teacherId)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
                 db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -69,19 +75,19 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     })
                     .from(attendance)
                     .innerJoin(classes, eq(attendance.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), gte(attendance.date, cutoff30))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, gte(attendance.date, cutoff30))),
                 db
                     .select({ total: count() })
                     .from(submissions)
                     .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                     .innerJoin(classes, eq(assignments.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), eq(submissions.status, "submitted"))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, eq(submissions.status, "submitted"))),
                 // Prior-period baselines for trend deltas — same shape, cut off 30 days earlier.
-                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), lt(classes.createdAt, daysAgo(30)))),
+                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope, lt(classes.createdAt, daysAgo(30)))),
                 db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(classes)
-                    .where(and(eq(classes.teacherId, teacherId), lt(classes.createdAt, daysAgo(30)))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, lt(classes.createdAt, daysAgo(30)))),
                 db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -89,20 +95,20 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     })
                     .from(attendance)
                     .innerJoin(classes, eq(attendance.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
                 // Assignment completion = actual submissions / (assignments × enrolled students) across the teacher's classes.
                 db
                     .select({ total: sql<number>`count(*)`.mapWith(Number) })
                     .from(assignments)
                     .innerJoin(classes, eq(assignments.classId, classes.id))
                     .innerJoin(enrollments, eq(enrollments.classId, classes.id))
-                    .where(eq(classes.teacherId, teacherId)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
                 db
                     .select({ total: count() })
                     .from(submissions)
                     .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                     .innerJoin(classes, eq(assignments.classId, classes.id))
-                    .where(eq(classes.teacherId, teacherId)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
             ]);
 
             const attendanceRate = attendanceStats && attendanceStats.total > 0
@@ -153,18 +159,18 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
             [pendingAssignments],
         ] = await Promise.all([
             isStudent && studentId
-                ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(eq(enrollments.studentId, studentId))
+                ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(and(eq(enrollments.studentId, studentId), contextClassIds ? inArray(enrollments.classId, contextClassIds) : undefined))
                 : db.select({ total: count() }).from(user).where(eq(user.role, "student")),
             db.select({ total: count() }).from(user).where(eq(user.role, "teacher")),
             isStudent && studentId
-                ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(eq(enrollments.studentId, studentId))
+                ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(and(eq(enrollments.studentId, studentId), contextClassIds ? inArray(enrollments.classId, contextClassIds) : undefined))
                 : db.select({ total: count() }).from(classes),
             isStudent && studentId
                 ? db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(enrollments)
                     .innerJoin(classes, eq(enrollments.classId, classes.id))
-                    .where(eq(enrollments.studentId, studentId))
+                    .where(and(eq(enrollments.studentId, studentId), contextClassScope))
                 : db.select({ total: count() }).from(subjects),
             isStudent && studentId
                 ? db
@@ -173,7 +179,7 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                         present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
                     })
                     .from(attendance)
-                    .where(and(eq(attendance.studentId, studentId), gte(attendance.date, cutoff30)))
+                    .where(and(eq(attendance.studentId, studentId), contextAttendanceScope, gte(attendance.date, cutoff30)))
                 : db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -199,7 +205,7 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                         present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
                     })
                     .from(attendance)
-                    .where(and(eq(attendance.studentId, studentId), gte(attendance.date, cutoff60), lt(attendance.date, cutoff30)))
+                    .where(and(eq(attendance.studentId, studentId), contextAttendanceScope, gte(attendance.date, cutoff60), lt(attendance.date, cutoff30)))
                 : db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -214,6 +220,7 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     .select({ total: sql<number>`count(*)`.mapWith(Number) })
                     .from(assignments)
                     .innerJoin(enrollments, eq(enrollments.classId, assignments.classId))
+                    .innerJoin(classes, eq(assignments.classId, classes.id))
                     .leftJoin(submissions, and(eq(submissions.assignmentId, assignments.id), eq(submissions.studentId, studentId)))
                     // "Pending" = still actionable: enrolled, not yet submitted, and
                     // the deadline hasn't passed (the submit route rejects anything
@@ -221,6 +228,7 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     // can act on — counting it here just makes the dashboard lie).
                     .where(and(
                         eq(enrollments.studentId, studentId),
+                        contextClassScope,
                         isNull(submissions.id),
                         or(isNull(assignments.dueAt), gt(assignments.dueAt, new Date())),
                     ))
@@ -274,6 +282,10 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
         const limit = Number.isFinite(requestedLimit)
             ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 100)
             : 5;
+        const contextClassIds = req.user?.id && (req.user.role === "teacher" || req.user.role === "student")
+            ? await activePortalClassIds({ ...req.user, id: req.user.id })
+            : null;
+        const activityScope = contextClassIds ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`) : undefined;
 
         const [recentAnnouncements, recentAssignments, recentSubmissions] = await Promise.all([
             db
@@ -296,6 +308,7 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 })
                 .from(assignments)
                 .innerJoin(classes, eq(assignments.classId, classes.id))
+                .where(activityScope)
                 .orderBy(desc(assignments.createdAt))
                 .limit(limit),
             db
@@ -308,6 +321,8 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 .from(submissions)
                 .innerJoin(user, eq(submissions.studentId, user.id))
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .innerJoin(classes, eq(assignments.classId, classes.id))
+                .where(activityScope)
                 .orderBy(desc(submissions.submittedAt))
                 .limit(limit),
         ]);
@@ -345,6 +360,72 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
     }
 });
 
+// GET /api/dashboard/attendance-today — a current, operational snapshot rather
+// than a misleading zero when the school has not yet recorded any marks. The
+// same role scoping as the trend endpoint applies: teachers see their classes,
+// students see their own records, and administrators see the school total.
+dashboardRouter.get("/attendance-today", requireAuth, async (req, res) => {
+    try {
+        const today = new Date().toISOString().slice(0, 10);
+        const isTeacher = req.user?.role === "teacher";
+        const isStudent = req.user?.role === "student";
+        const userId = req.user?.id;
+        const contextClassIds = userId && (isTeacher || isStudent)
+            ? await activePortalClassIds({ ...req.user!, id: userId })
+            : null;
+        const contextClassScope = contextClassIds
+            ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
+            : undefined;
+        const scope = isTeacher && userId
+            ? and(eq(classes.teacherId, userId), contextClassScope)
+            : isStudent && userId
+                ? and(eq(attendance.studentId, userId), contextClassScope)
+                : undefined;
+
+        const [summary] = await db
+            .select({
+                total: sql<number>`count(*)`.mapWith(Number),
+                present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
+                absent: sql<number>`count(*) filter (where ${attendance.status} = 'absent')`.mapWith(Number),
+                late: sql<number>`count(*) filter (where ${attendance.status} = 'late')`.mapWith(Number),
+                excused: sql<number>`count(*) filter (where ${attendance.status} = 'excused')`.mapWith(Number),
+            })
+            .from(attendance)
+            .innerJoin(classes, eq(attendance.classId, classes.id))
+            .where(scope ? and(eq(attendance.date, today), scope) : eq(attendance.date, today));
+
+        // For a teacher, an empty attendance register is actionable. Keep the
+        // class list separate from the school-wide snapshot so an admin never
+        // receives a potentially overwhelming and unactionable list.
+        let unrecordedClasses: { id: number; name: string }[] = [];
+        if (isTeacher && userId) {
+            const [myClasses, recorded] = await Promise.all([
+                db.select({ id: classes.id, name: classes.name }).from(classes).where(and(eq(classes.teacherId, userId), contextClassScope)),
+                db.select({ classId: attendance.classId })
+                    .from(attendance)
+                    .innerJoin(classes, eq(attendance.classId, classes.id))
+                    .where(and(eq(attendance.date, today), eq(classes.teacherId, userId), contextClassScope))
+                    .groupBy(attendance.classId),
+            ]);
+            const recordedIds = new Set(recorded.map((row) => row.classId));
+            unrecordedClasses = myClasses.filter((item) => !recordedIds.has(item.id));
+        }
+
+        res.json({
+            date: today,
+            total: summary?.total ?? 0,
+            present: summary?.present ?? 0,
+            absent: summary?.absent ?? 0,
+            late: summary?.late ?? 0,
+            excused: summary?.excused ?? 0,
+            unrecordedClasses,
+        });
+    } catch (error) {
+        console.error("Dashboard attendance-today error:", error);
+        res.status(500).json({ message: "Failed to load today's attendance" });
+    }
+});
+
 // GET /api/dashboard/attendance-trend?range=7|30|90|365 — attendance
 // present/absent/late breakdown bucketed by day (<=30d), week (90d), or month
 // (365d). Scoped to the teacher's own classes for teachers, to the student's
@@ -356,6 +437,12 @@ dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
+        const contextClassIds = userId && (isTeacher || isStudent)
+            ? await activePortalClassIds({ ...req.user!, id: userId })
+            : null;
+        const contextClassScope = contextClassIds
+            ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
+            : undefined;
 
         const days = ATTENDANCE_RANGE_DAYS[String(req.query.range ?? "30")] ?? 30;
         const bucket = days > 90
@@ -367,6 +454,7 @@ dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
         const conditions = [gte(attendance.date, daysAgoISO(days))];
         if (isTeacher && userId) conditions.push(eq(classes.teacherId, userId));
         if (isStudent && userId) conditions.push(eq(attendance.studentId, userId));
+        if (contextClassScope) conditions.push(contextClassScope);
 
         const rows = await db
             .select({
@@ -406,10 +494,16 @@ dashboardRouter.get("/grade-distribution", requireAuth, async (req, res) => {
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
+        const contextClassIds = userId && (isTeacher || isStudent)
+            ? await activePortalClassIds({ ...req.user!, id: userId })
+            : null;
+        const contextClassScope = contextClassIds
+            ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
+            : undefined;
         const scopeClause = isTeacher && userId
-            ? eq(classes.teacherId, userId)
+            ? and(eq(classes.teacherId, userId), contextClassScope)
             : isStudent && userId
-                ? eq(classGrades.studentId, userId)
+                ? and(eq(classGrades.studentId, userId), contextClassScope)
                 : undefined;
 
         const rows = await db
@@ -442,17 +536,23 @@ dashboardRouter.get("/class-activity", requireAuth, async (req, res) => {
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
+        const contextClassIds = userId && (isTeacher || isStudent)
+            ? await activePortalClassIds({ ...req.user!, id: userId })
+            : null;
+        const contextClassScope = contextClassIds
+            ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
+            : undefined;
         const since = daysAgoISO(30);
         const sinceDate = daysAgo(30);
 
         let scopeClause;
         if (isTeacher && userId) {
-            scopeClause = eq(classes.teacherId, userId);
+            scopeClause = and(eq(classes.teacherId, userId), contextClassScope);
         } else if (isStudent && userId) {
             const enrolled = await db.select({ classId: enrollments.classId }).from(enrollments).where(eq(enrollments.studentId, userId));
             const classIds = enrolled.map((r) => r.classId);
             if (classIds.length === 0) return res.json({ data: [] });
-            scopeClause = inArray(classes.id, classIds);
+            scopeClause = and(inArray(classes.id, classIds), contextClassScope);
         }
 
         const [assignmentCounts, submissionCounts, attendanceCounts, gradeAverages, classRows] = await Promise.all([

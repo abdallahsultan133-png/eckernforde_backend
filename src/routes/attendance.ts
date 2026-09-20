@@ -11,6 +11,7 @@ import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
 import { getLinkedChildIds } from "../lib/policy.js";
 import crypto from "crypto";
+import { isInActivePortalClass } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -29,6 +30,9 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only view rosters for classes you teach.");
+        }
+        if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const roster = await db
@@ -74,6 +78,9 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(markAtte
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only mark attendance for classes you teach.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const markedBy = req.user!.id!;

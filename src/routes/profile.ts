@@ -1,7 +1,7 @@
 import express from "express";
 import { eq, or } from "drizzle-orm";
 import { db } from "../db/index.js";
-import { studentProfiles, classGrades, attendance, classes, enrollments } from "../db/schema/app.js";
+import { studentProfiles, classGrades, attendance, classes, enrollments, subjects } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
@@ -105,8 +105,8 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
         if (!studentUser) return res.status(404).json({ error: "Student not found" });
         const [profile] = await db.select().from(studentProfiles).where(eq(studentProfiles.userId, studentId));
         const enrolledClasses = await db
-            .select({ id: classes.id, name: classes.name })
-            .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id))
+            .select({ id: classes.id, name: classes.name, subject: { id: subjects.id, name: subjects.name } })
+            .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).leftJoin(subjects, eq(classes.subjectId, subjects.id))
             .where(eq(enrollments.studentId, studentId));
         const grades = await db
             .select({ classId: classGrades.classId, finalGrade: classGrades.finalGrade, letterGrade: classGrades.letterGrade })
@@ -195,8 +195,8 @@ router.get("/my-children", requireAuth, async (req, res) => {
                 .from(user).where(eq(user.id, childId));
             const [profile] = await db.select().from(studentProfiles).where(eq(studentProfiles.userId, childId));
             const enrolledClasses = await db
-                .select({ id: classes.id, name: classes.name })
-                .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id))
+                .select({ id: classes.id, name: classes.name, subject: { id: subjects.id, name: subjects.name } })
+                .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).leftJoin(subjects, eq(classes.subjectId, subjects.id))
                 .where(eq(enrollments.studentId, childId));
             const grades = await db
                 .select({ classId: classGrades.classId, finalGrade: classGrades.finalGrade, letterGrade: classGrades.letterGrade })

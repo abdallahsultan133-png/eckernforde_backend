@@ -2,9 +2,11 @@ import express from "express";
 import { desc, eq } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { admissionsEnquiries } from "../db/schema/app.js";
+import { user } from "../db/schema/auth.js";
 import { createAdmissionEnquirySchema } from "../lib/schemas.js";
 import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
+import { sendAdmissionEnquiryEmail } from "../lib/email.js";
 
 const router = express.Router();
 
@@ -22,6 +24,12 @@ router.post("/enquiries", validateBody(createAdmissionEnquirySchema), async (req
             message: message || null,
             consent,
         });
+        const configuredRecipients = [process.env.ADMISSIONS_NOTIFICATION_EMAIL, process.env.SCHOOL_ADMIN_EMAIL].filter((value): value is string => Boolean(value?.trim()));
+        const superAdmins = await db.select({ email: user.email }).from(user).where(eq(user.role, "super_admin"));
+        const recipients = [...new Set([...configuredRecipients, ...superAdmins.map((admin) => admin.email).filter(Boolean)])];
+        for (const notificationEmail of recipients) {
+            void sendAdmissionEnquiryEmail({ to: notificationEmail, fullName, email, phone, childStage, message });
+        }
         res.status(201).json({ data: { received: true } });
     } catch (error) {
         console.error("POST /admissions/enquiries error:", error instanceof Error ? error.message : "unknown error");

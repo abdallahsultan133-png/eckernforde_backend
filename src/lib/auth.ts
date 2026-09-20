@@ -1,8 +1,10 @@
-import { betterAuth } from "better-auth";
+import { APIError, betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { db } from "../db/index.js";
 import * as schema from '../db/schema/auth.js'
 import { sendWelcomeEmail, sendPasswordResetEmail } from "./email.js";
+import { eq } from "drizzle-orm";
+import { systemSettings } from "../db/schema/app.js";
 
 // Only register the Google provider once real credentials are present —
 // betterAuth() throws at startup if a social provider is configured with an
@@ -77,6 +79,26 @@ export const auth = betterAuth({
     },
 
     databaseHooks: {
+        session: {
+            create: {
+                // Enforce role login switches at session creation as well as
+                // on API requests, so disabled role groups cannot establish a
+                // new authenticated portal session.
+                before: async (session) => {
+                    const [account] = await db.select({ role: schema.user.role }).from(schema.user).where(eq(schema.user.id, session.userId));
+                    if (account?.role === "super_admin") return true;
+                    const [settings] = await db.select({
+                        enabled: systemSettings.enabled,
+                        teachersEnabled: systemSettings.teachersEnabled,
+                        studentsParentsEnabled: systemSettings.studentsParentsEnabled,
+                    }).from(systemSettings).where(eq(systemSettings.id, 1));
+                    if (settings?.enabled === false) throw new APIError("FORBIDDEN", { message: "The school system is temporarily offline.", code: "SYSTEM_OFFLINE" });
+                    if (account?.role === "teacher" && settings?.teachersEnabled === false) throw new APIError("FORBIDDEN", { message: "Teacher login is temporarily disabled.", code: "TEACHER_LOGIN_DISABLED" });
+                    if ((account?.role === "student" || account?.role === "parent") && settings?.studentsParentsEnabled === false) throw new APIError("FORBIDDEN", { message: "Student and parent login is temporarily disabled.", code: "STUDENT_PARENT_LOGIN_DISABLED" });
+                    return true;
+                },
+            },
+        },
         user: {
             create: {
                 after: async (newUser) => {

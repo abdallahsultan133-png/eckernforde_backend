@@ -21,6 +21,9 @@ import uploadsRouter from "./routes/uploads.js";
 import filesRouter from "./routes/files.js";
 import aiAssistantRouter from "./routes/ai-assistant.js";
 import admissionsRouter from "./routes/admissions.js";
+import portalContextRouter from "./routes/portal-context.js";
+import reportCardTemplateRouter from "./routes/report-card-template.js";
+import systemRouter from "./routes/system.js";
 import securityMiddleware from "./middleware/security.js";
 import {resolveSession} from "./middleware/resolve-session.js";
 import {toNodeHandler} from "better-auth/node";
@@ -28,6 +31,7 @@ import {auth} from "./lib/auth.js";
 import {startScheduledJobs} from "./lib/scheduled-jobs.js";
 import {sql} from "drizzle-orm";
 import {db, pool} from "./db/index.js";
+import {requireSystemEnabled} from "./middleware/system-status.js";
 
 const app = express();
 app.set("trust proxy", true);
@@ -58,6 +62,7 @@ app.use(securityMiddleware);
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
 app.use(express.json());
+app.use(requireSystemEnabled);
 
 app.use('/api/subjects', subjectsRouter)
 app.use('/api/users', usersRouter)
@@ -77,6 +82,9 @@ app.use('/api/uploads', uploadsRouter)
 app.use('/api/files', filesRouter)
 app.use('/api/ai-assistant', aiAssistantRouter)
 app.use('/api/admissions', admissionsRouter)
+app.use('/api/portal-context', portalContextRouter)
+app.use('/api/report-card-template', reportCardTemplateRouter)
+app.use('/api/system', systemRouter)
 
 app.get('/', (req, res) => {
     res.json({ service: 'School platform API', status: 'ok' });
@@ -90,6 +98,13 @@ app.get('/healthz', async (req, res) => {
         console.error('[healthz] DB check failed:', e);
         res.status(503).json({ status: 'error', db: 'down' });
     }
+});
+
+// Keep API failures machine-readable. Express's default 404 page is HTML,
+// which makes unknown endpoints unnecessarily difficult for the frontend and
+// operational probes to diagnose.
+app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Not found', message: 'API route not found.' });
 });
 
 console.log("BETTER_AUTH_URL:", process.env.BETTER_AUTH_URL);

@@ -1,11 +1,11 @@
 /**
- * Email notification service using Resend.
+ * Email notification service using Brevo (preferred) or Resend.
  * All functions are fire-and-forget (never throw) — email failures
  * should never break the main request flow.
  *
- * Setup required:
- *   1. Add RESEND_API_KEY=re_... to classroom-backend/.env
- *   2. Add RESEND_FROM_EMAIL=noreply@yourdomain.com to .env
+ * Setup required (Brevo):
+ *   1. Add BREVO_API_KEY=xkeysib-... to classroom-backend/.env
+ *   2. Add BREVO_FROM_EMAIL=noreply@yourdomain.com and optionally BREVO_FROM_NAME.
  *      (use "Classroom MS <noreply@yourdomain.com>" format for display name)
  *
  * If RESEND_API_KEY is not set, all email functions silently no-op.
@@ -16,6 +16,8 @@ type EmailParams = {
     subject: string;
     html: string;
 };
+
+const PRODUCT_NAME = process.env.SCHOOL_NAME?.trim() || "Your School";
 
 // User-supplied strings (announcement content, feedback, names, titles) get
 // interpolated straight into these HTML email templates. Without escaping,
@@ -74,18 +76,39 @@ const footerStyle = `
 const wrap = (content: string) => `
 <div style="${baseStyle}">
     <div style="${headerStyle}">
-        <h1 style="margin:0;font-size:20px;font-weight:700;">🎓 ClassroomMS</h1>
+        <h1 style="margin:0;font-size:20px;font-weight:700;">${PRODUCT_NAME}</h1>
     </div>
     <div style="${bodyStyle}">${content}</div>
     <div style="${footerStyle}">
-        You received this because you are enrolled in a ClassroomMS class.<br/>
-        © ${new Date().getFullYear()} ClassroomMS
+        You received this because you are part of the school community.<br/>
+        © ${new Date().getFullYear()} ${PRODUCT_NAME}
     </div>
 </div>`;
 
 async function sendEmail(params: EmailParams): Promise<void> {
+    const brevoKey = process.env.BREVO_API_KEY;
+    const brevoFrom = process.env.BREVO_FROM_EMAIL;
+    if (brevoKey && brevoFrom) {
+        try {
+            const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+                method: "POST",
+                headers: { "api-key": brevoKey, "Content-Type": "application/json", Accept: "application/json" },
+                body: JSON.stringify({
+                    sender: { email: brevoFrom, name: process.env.BREVO_FROM_NAME ?? PRODUCT_NAME },
+                    to: (Array.isArray(params.to) ? params.to : [params.to]).map((email) => ({ email })),
+                    subject: params.subject,
+                    htmlContent: params.html,
+                }),
+            });
+            if (!res.ok) console.warn("[Email] Brevo error:", await res.json().catch(() => ({})));
+        } catch (e) {
+            console.warn("[Email] Failed to send via Brevo (non-fatal):", e);
+        }
+        return;
+    }
+
     const apiKey = process.env.RESEND_API_KEY;
-    const from = process.env.RESEND_FROM_EMAIL ?? "ClassroomMS <noreply@classroomms.com>";
+    const from = process.env.RESEND_FROM_EMAIL ?? `${PRODUCT_NAME} <onboarding@resend.dev>`;
 
     if (!apiKey) {
         // Silently skip if not configured — log once so devs know
@@ -115,6 +138,31 @@ async function sendEmail(params: EmailParams): Promise<void> {
     } catch (e) {
         console.warn("[Email] Failed to send email (non-fatal):", e);
     }
+}
+
+export async function sendAdmissionEnquiryEmail(params: {
+    to: string;
+    fullName: string;
+    email: string;
+    phone?: string | null;
+    childStage: string;
+    message?: string | null;
+}): Promise<void> {
+    await sendEmail({
+        to: params.to,
+        subject: `New admissions enquiry from ${params.fullName}`,
+        html: wrap(`
+            <h2 style="margin:0 0 8px;font-size:18px;">New Admissions Enquiry</h2>
+            <p style="color:#475569;margin:0 0 16px;">A prospective family submitted an enquiry through the school website.</p>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;">
+                <p><strong>Name:</strong> ${escapeHtml(params.fullName)}</p>
+                <p><strong>Email:</strong> ${escapeHtml(params.email)}</p>
+                ${params.phone ? `<p><strong>Phone:</strong> ${escapeHtml(params.phone)}</p>` : ""}
+                <p><strong>Stage:</strong> ${escapeHtml(params.childStage)}</p>
+                ${params.message ? `<p><strong>Message:</strong><br/>${escapeHtml(params.message)}</p>` : ""}
+            </div>
+        `),
+    });
 }
 
 // ─── PUBLIC EMAIL FUNCTIONS ────────────────────────────────────────────────
@@ -219,7 +267,7 @@ export async function sendWelcomeEmail(params: {
 }): Promise<void> {
     await sendEmail({
         to: params.to,
-        subject: "Welcome to ClassroomMS!",
+        subject: `Welcome to ${PRODUCT_NAME}`,
         html: wrap(`
             <h2 style="margin:0 0 8px;font-size:18px;">Welcome, ${escapeHtml(params.name)}! 🎉</h2>
             <p style="color:#475569;margin:0 0 16px;">Your account has been created. You can now log in and access your classes, assignments, and grades.</p>
@@ -240,7 +288,7 @@ export async function sendPasswordResetEmail(params: {
 }): Promise<void> {
     await sendEmail({
         to: params.to,
-        subject: "Reset your ClassroomMS password",
+        subject: `Reset your ${PRODUCT_NAME} password`,
         html: wrap(`
             <h2 style="margin:0 0 8px;font-size:18px;">Reset your password</h2>
             <p style="color:#475569;margin:0 0 16px;">

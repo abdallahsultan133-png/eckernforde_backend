@@ -1,8 +1,8 @@
 import express from "express";
-import { and, desc, eq, getTableColumns, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gte, inArray, lte, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
-import { assignments, classes, enrollments, submissions } from "../db/schema/app.js";
+import { assignments, classes, enrollments, submissions, subjects } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
@@ -13,6 +13,7 @@ import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
 import { getLinkedChildIds } from "../lib/policy.js";
 import { runAiDetection } from "../lib/ai-detector.js";
+import { activePortalClassIds, isInActivePortalClass } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -20,31 +21,58 @@ const router = express.Router();
 // Lists assignments, optionally scoped to a class, newest first.
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { classId, page = 1, limit = 20 } = req.query;
+        const { classId, subjectId, childId, academicYearId, page = 1, limit = 20, dueFrom, dueTo, sort } = req.query;
 
         const currentPage = Math.max(1, parseInt(String(page), 10) || 1);
         const limitPerPage = Math.min(Math.max(1, parseInt(String(limit), 10) || 20), 100);
         const offset = (currentPage - 1) * limitPerPage;
 
         const conditions = [];
+        for (const [raw, lower] of [[dueFrom, true], [dueTo, false]] as const) {
+            if (raw !== undefined) {
+                if (typeof raw !== "string" || !Number.isFinite(Date.parse(raw))) {
+                    return res.status(400).json({ error: "Invalid deadline range" });
+                }
+                conditions.push(lower ? gte(assignments.dueAt, new Date(raw)) : lte(assignments.dueAt, new Date(raw)));
+            }
+        }
         if (classId) conditions.push(eq(assignments.classId, Number(classId)));
+        if (subjectId) conditions.push(eq(classes.subjectId, Number(subjectId)));
         // Row-level list scoping (policy): a teacher only sees assignments for
         // classes they teach; admins/super_admins see everything.
         const teacherScope = policy.teacherClassScope(req.user!);
         if (teacherScope) conditions.push(teacherScope);
 
+        const caller = req.user!;
+        if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
+            const selectedClassIds = await activePortalClassIds({ ...caller, id: caller.id });
+            if (selectedClassIds) conditions.push(selectedClassIds.length ? inArray(assignments.classId, selectedClassIds) : sql`false`);
+        }
+
         // A parent only sees assignments for classes their own linked
         // children are enrolled in — not every class in the school.
         if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
-            const childClassIds = childIds.length > 0
+            const requestedChildId = typeof childId === "string" && childId.trim() ? childId.trim() : null;
+            if (requestedChildId && !childIds.includes(requestedChildId)) {
+                return policy.forbidden(res, "You can only view assignments for your linked children.");
+            }
+            const scopedChildIds = requestedChildId ? [requestedChildId] : childIds;
+            const childClassIds = scopedChildIds.length > 0
                 ? [...new Set((await db
                     .select({ classId: enrollments.classId })
                     .from(enrollments)
-                    .where(inArray(enrollments.studentId, childIds))
+                    .where(inArray(enrollments.studentId, scopedChildIds))
                 ).map((r) => r.classId))]
                 : [];
             conditions.push(childClassIds.length > 0 ? inArray(assignments.classId, childClassIds) : sql`false`);
+            if (academicYearId !== undefined) {
+                const selectedYearId = Number(academicYearId);
+                if (!Number.isInteger(selectedYearId) || selectedYearId <= 0) {
+                    return res.status(400).json({ error: "Invalid academic year" });
+                }
+                conditions.push(eq(classes.academicYearId, selectedYearId));
+            }
         }
 
         // A student only sees assignments for classes they're actually enrolled
@@ -65,13 +93,15 @@ router.get("/", requireAuth, async (req, res) => {
             .select({
                 ...getTableColumns(assignments),
                 class: { id: classes.id, name: classes.name },
+                subject: { id: subjects.id, name: subjects.name },
                 creator: { id: user.id, name: user.name },
             })
             .from(assignments)
             .innerJoin(classes, eq(assignments.classId, classes.id))
+            .leftJoin(subjects, eq(classes.subjectId, subjects.id))
             .innerJoin(user, eq(assignments.createdBy, user.id))
             .where(whereClause)
-            .orderBy(desc(assignments.dueAt))
+            .orderBy(sort === "dueSoon" ? asc(assignments.dueAt) : desc(assignments.dueAt))
             .limit(limitPerPage)
             .offset(offset);
 
@@ -122,6 +152,103 @@ router.get("/", requireAuth, async (req, res) => {
     }
 });
 
+// GET /api/assignments/:id/report — teacher/admin only. Returns the marks
+// matrix for every assignment in the selected class subject.
+router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+
+        const [selectedAssignment] = await db
+            .select({
+                id: assignments.id,
+                classId: assignments.classId,
+                title: assignments.title,
+                class: { id: classes.id, name: classes.name },
+                subject: { id: subjects.id, name: subjects.name, code: subjects.code },
+            })
+            .from(assignments)
+            .innerJoin(classes, eq(assignments.classId, classes.id))
+            .innerJoin(subjects, eq(classes.subjectId, subjects.id))
+            .where(eq(assignments.id, id));
+
+        if (!selectedAssignment) return res.status(404).json({ error: "Assignment not found" });
+
+        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, selectedAssignment.classId))) {
+            return policy.forbidden(res, "You can only view reports for classes you teach.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, selectedAssignment.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+        }
+
+        const reportAssignments = await db
+            .select({ id: assignments.id, title: assignments.title, dueAt: assignments.dueAt, maxScore: assignments.maxScore })
+            .from(assignments)
+            .where(eq(assignments.classId, selectedAssignment.classId))
+            .orderBy(asc(assignments.dueAt), asc(assignments.id));
+
+        const classStudents = await db
+            .select({ id: user.id, name: user.name, email: user.email })
+            .from(enrollments)
+            .innerJoin(user, eq(enrollments.studentId, user.id))
+            .where(eq(enrollments.classId, selectedAssignment.classId))
+            .orderBy(asc(user.name));
+
+        const assignmentIds = reportAssignments.map((assignment) => assignment.id);
+        const reportSubmissions = assignmentIds.length > 0
+            ? await db
+                .select({ assignmentId: submissions.assignmentId, studentId: submissions.studentId, status: submissions.status, score: submissions.score })
+                .from(submissions)
+                .where(inArray(submissions.assignmentId, assignmentIds))
+            : [];
+        const submissionByKey = new Map(reportSubmissions.map((submission) => [`${submission.studentId}:${submission.assignmentId}`, submission]));
+
+        const students = classStudents.map((student) => {
+            const marks = reportAssignments.map((assignment) => {
+                const submission = submissionByKey.get(`${student.id}:${assignment.id}`);
+                return {
+                    assignmentId: assignment.id,
+                    score: submission?.score ?? null,
+                    status: submission?.status ?? "not_submitted",
+                };
+            });
+            const scoredMarks = reportAssignments
+                .map((assignment, index) => ({ score: marks[index]?.score ?? null, maxScore: assignment.maxScore }))
+                .filter((mark): mark is { score: number; maxScore: number } => mark.score !== null);
+            const totalScore = scoredMarks.reduce((sum, mark) => sum + mark.score, 0);
+            const totalMaxScore = scoredMarks.reduce((sum, mark) => sum + mark.maxScore, 0);
+            return {
+                ...student,
+                marks,
+                totalScore,
+                totalMaxScore,
+                averagePercent: totalMaxScore > 0 ? Math.round((totalScore / totalMaxScore) * 1000) / 10 : null,
+            };
+        });
+
+        const averages = students.map((student) => student.averagePercent).filter((average): average is number => average !== null);
+        const gradedMarks = reportSubmissions.filter((submission) => submission.status === "graded" && submission.score !== null).length;
+        res.json({
+            data: {
+                selectedAssignment: { id: selectedAssignment.id, title: selectedAssignment.title },
+                class: selectedAssignment.class,
+                subject: selectedAssignment.subject,
+                assignments: reportAssignments,
+                students,
+                summary: {
+                    studentCount: students.length,
+                    assignmentCount: reportAssignments.length,
+                    gradedMarks,
+                    classAveragePercent: averages.length ? Math.round((averages.reduce((sum, average) => sum + average, 0) / averages.length) * 10) / 10 : null,
+                },
+            },
+        });
+    } catch (e) {
+        console.error("GET /assignments/:id/report error:", e);
+        res.status(500).json({ error: "Failed to load assignment report" });
+    }
+});
+
 // GET /api/assignments/:id
 // Assignment detail. If the caller is a student, also returns their own submission (if any).
 router.get("/:id", requireAuth, async (req, res) => {
@@ -141,6 +268,10 @@ router.get("/:id", requireAuth, async (req, res) => {
             .where(eq(assignments.id, id));
 
         if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+
+        if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, assignment.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+        }
 
         if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
@@ -181,6 +312,9 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only create assignments for classes you teach.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const [created] = await db
@@ -245,6 +379,9 @@ router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(update
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
             return policy.forbidden(res, "You can only edit assignments for classes you teach.");
         }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+        }
 
         const { title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
             title?: string;
@@ -292,6 +429,9 @@ router.delete("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res)
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
             return policy.forbidden(res, "You can only delete assignments for classes you teach.");
         }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+        }
 
         const [deleted] = await db.delete(assignments).where(eq(assignments.id, id)).returning({ id: assignments.id });
         if (!deleted) return res.status(404).json({ error: "Assignment not found" });
@@ -323,6 +463,9 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
 
         if (!(await policy.isEnrolledInClass(req.user!.id!, assignment.classId))) {
             return policy.forbidden(res, "You are not enrolled in this class.");
+        }
+        if (!(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, assignment.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
         }
 
         // Once the deadline passes, submission is closed entirely — no more
@@ -379,6 +522,9 @@ router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, assignment.classId))) {
             return policy.forbidden(res, "You can only view submissions for classes you teach.");
         }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, assignment.classId))) {
+            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+        }
 
         const rows = await db
             .select({
@@ -412,6 +558,9 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
             if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
             if (!(await policy.canManageClass(req.user!, existingSubmission.classId))) {
                 return policy.forbidden(res, "You can only grade submissions for classes you teach.");
+            }
+            if (!(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existingSubmission.classId))) {
+                return policy.forbidden(res, "This assignment is outside your selected portal context.");
             }
         }
 

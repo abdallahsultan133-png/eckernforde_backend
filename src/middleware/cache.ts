@@ -27,6 +27,14 @@ type Entry = { body: unknown; expires: number };
 const store = new Map<string, Entry>();
 const MAX_ENTRIES = 1000;
 
+/** Clears a user's cached dashboard rollups after their portal class/form changes. */
+export function clearShortCacheForUser(userId: string) {
+    const prefix = `${userId}:`;
+    for (const key of store.keys()) {
+        if (key.startsWith(prefix)) store.delete(key);
+    }
+}
+
 function sweep(now: number) {
     for (const [key, entry] of store) {
         if (entry.expires <= now) store.delete(key);

@@ -13,6 +13,7 @@ export const createClassSchema = z.object({
     bannerCldPubId: z.string().optional().nullable(),
     status: z.enum(["active", "inactive", "archived"]).optional(),
     schoolLevel: z.enum(["nursery", "primary", "secondary"]).optional().nullable(),
+    academicYearId: z.number().int().positive().optional().nullable(),
 });
 export const updateClassSchema = createClassSchema.partial();
 
@@ -30,7 +31,9 @@ export const enrollSchema = z
 // ─── SUBJECTS / DEPARTMENTS ──────────────────────────────────────────────────
 export const createSubjectSchema = z.object({
     name: z.string().trim().min(1, "name is required").max(255),
-    code: z.string().trim().min(1, "code is required").max(50),
+    // Codes are system identifiers. Older integrations may still send one,
+    // but the subject UI no longer asks staff to create or maintain it.
+    code: z.string().trim().min(1).max(50).optional(),
     description: z.string().max(255).optional().nullable(),
     departmentId: z.number().int().positive(),
 });
@@ -97,6 +100,7 @@ export const gradeSubmissionSchema = z.object({
 export const createExamSchema = z.object({
     classId: z.number().int().positive(),
     title: z.string().trim().min(1, "title is required").max(255),
+    examType: z.enum(["midterm", "annual"]).default("midterm"),
     description: z.string().max(5000).optional().nullable(),
     scheduledAt: z.string().optional().nullable(),
     durationMinutes: z.number().int().positive().optional().nullable(),
@@ -109,7 +113,7 @@ export const examResultsSchema = z.object({
         .array(
             z.object({
                 studentId: z.string().min(1),
-                score: z.number().min(0),
+                score: z.number().int("score must be a whole number").min(0),
                 remarks: z.string().max(1000).optional().nullable(),
             })
         )
@@ -134,7 +138,10 @@ export const createAcademicYearSchema = z.object({
     startsOn: dateStr,
     endsOn: dateStr,
     active: z.boolean().optional(),
-}).refine((value) => value.endsOn >= value.startsOn, { message: "endsOn must be after startsOn", path: ["endsOn"] });
+}).refine((value) => {
+    const calendarYear = value.startsOn.slice(0, 4);
+    return value.startsOn === `${calendarYear}-01-01` && value.endsOn === `${calendarYear}-12-31`;
+}, { message: "Academic years run from January 1 through December 31.", path: ["endsOn"] });
 
 export const createAcademicTermSchema = z.object({
     academicYearId: z.number().int().positive(),

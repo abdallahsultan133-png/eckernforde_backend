@@ -1,15 +1,19 @@
 import express from "express";
-import {and, desc, eq, getTableColumns, ilike, or, sql} from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+import {and, desc, eq, getTableColumns, ilike, inArray, or, sql} from "drizzle-orm";
 
-import {departments, subjects} from "../db/schema/index.js";
+import {classes, departments, subjects} from "../db/schema/index.js";
 import { db } from "../db/index.js";
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createSubjectSchema, updateSubjectSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
+import { activePortalClassIds } from "../lib/portal-context.js";
 
 const router = express.Router();
+
+const generatedSubjectCode = () => `SUBJ-${randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase()}`;
 
 // Get all subjects with optional search, filtering and pagination
 router.get("/", requireAuth, async (req, res) => {
@@ -37,6 +41,28 @@ router.get("/", requireAuth, async (req, res) => {
         if (department) {
             const deptPattern = `%${String(department).replace(/[%_]/g, '\\$&')}%`;
             filterConditions.push(ilike(departments.name, deptPattern));
+        }
+
+        const caller = req.user!;
+        if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
+            const classIds = await activePortalClassIds({ ...caller, id: caller.id });
+            if (classIds) {
+                const rows = classIds.length
+                    ? await db.select({ subjectId: classes.subjectId }).from(classes).where(inArray(classes.id, classIds))
+                    : [];
+                const subjectIds = [...new Set(rows.map((row) => row.subjectId))];
+                if (policy.isTeacher(caller)) {
+                    // A teacher must be able to see a subject immediately after
+                    // creating it, before it has been assigned to a class.
+                    filterConditions.push(
+                        subjectIds.length
+                            ? or(eq(subjects.createdBy, caller.id), inArray(subjects.id, subjectIds))
+                            : eq(subjects.createdBy, caller.id),
+                    );
+                } else {
+                    filterConditions.push(subjectIds.length ? inArray(subjects.id, subjectIds) : sql`false`);
+                }
+            }
         }
 
         // Subjects are shared reference data (name / code / department only — no
@@ -90,12 +116,12 @@ router.get("/", requireAuth, async (req, res) => {
 router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createSubjectSchema), async (req, res) => {
     try {
         const { name, code, description, departmentId } = req.body as {
-            name: string; code: string; description?: string | null; departmentId: number;
+            name: string; code?: string; description?: string | null; departmentId: number;
         };
 
         const [created] = await db
             .insert(subjects)
-            .values({ name: name.trim(), code: code.trim(), description: description ?? null, departmentId, createdBy: req.user!.id! })
+            .values({ name: name.trim(), code: code?.trim() || generatedSubjectCode(), description: description ?? null, departmentId, createdBy: req.user!.id! })
             .returning();
 
         await logAction({ req, action: "subject.create", resource: "subjects", resourceId: created?.id, details: `Created subject "${name.trim()}"` });
