@@ -11,6 +11,7 @@ import { notifyEnrolledStudents } from "./notifications.js";
 import { sendAnnouncementEmail } from "../lib/email.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
+import { activePortalClassIds } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -68,6 +69,15 @@ router.get("/", requireAuth, async (req, res) => {
             visibilityClause = classIds.length > 0
                 ? or(isNull(announcements.classId), inArray(announcements.classId, classIds))
                 : isNull(announcements.classId);
+        }
+
+        if (req.user?.id && (policy.isTeacher(req.user) || policy.isStudent(req.user))) {
+            const selectedClassIds = await activePortalClassIds({ ...req.user, id: req.user.id });
+            if (selectedClassIds) {
+                visibilityClause = selectedClassIds.length
+                    ? or(isNull(announcements.classId), inArray(announcements.classId, selectedClassIds))
+                    : isNull(announcements.classId);
+            }
         }
 
         const conditions = [];

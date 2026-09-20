@@ -15,7 +15,7 @@ import {
     files,
 } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
-import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
+import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { aiChatSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
@@ -163,7 +163,7 @@ const getStudentProfileTool = betaZodTool({
     run: async ({ studentId }) => JSON.stringify(await getStudentFullProfile(studentId)),
 });
 
-const SYSTEM_PROMPT = `You are the AI Student Assistant inside ClassroomMS, a classroom management system. You are only ever used by teachers, admins, and super admins looking up information about students.
+const SYSTEM_PROMPT = `You are the AI Student Assistant inside the school platform. You are used only by authorized school administrators looking up student information.
 
 Guidelines:
 - When the user names a student rather than giving an exact ID, call search_students first to resolve who they mean. If more than one student matches, list the candidates (name, email, registration number) and ask which one — never guess.
@@ -177,7 +177,7 @@ Guidelines:
 router.post(
     "/chat",
     requireAuth,
-    requireRole(...STAFF_ROLES),
+    requireRole(...ADMIN_ROLES),
     validateBody(aiChatSchema),
     async (req, res) => {
         try {

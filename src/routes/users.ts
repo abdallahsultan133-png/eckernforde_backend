@@ -1,8 +1,9 @@
 import express from "express";
 import { randomBytes } from "node:crypto";
-import {and, desc, eq, getTableColumns, ilike, or, sql} from "drizzle-orm";
+import {and, desc, eq, exists, getTableColumns, ilike, or, sql} from "drizzle-orm";
 
 import {user, account} from "../db/schema/index.js";
+import { classes, enrollments } from "../db/schema/app.js";
 import { db } from "../db/index.js";
 import { auth } from "../lib/auth.js";
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from "../middleware/require-auth.js";
@@ -53,9 +54,37 @@ router.get("/teachers", requireAuth, async (req, res) => {
 // instead of requiring an exact email lookup per student.
 router.get("/students", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
-        const { search } = req.query;
+        const { search, classId: rawClassId } = req.query;
 
         const conditions = [eq(user.role, "student")];
+        if (policy.isTeacher(req.user!) && rawClassId !== undefined) {
+            const classId = Number(rawClassId);
+            if (!Number.isInteger(classId) || classId <= 0 || !(await policy.canManageClass(req.user!, classId))) {
+                return policy.forbidden(res, "Teachers can only browse students in a class they teach.");
+            }
+            const [targetClass] = await db
+                .select({ academicYearId: classes.academicYearId })
+                .from(classes)
+                .where(eq(classes.id, classId));
+            if (!targetClass) return res.status(404).json({ error: "Class not found." });
+
+            // A teacher may reuse students when managing another subject class.
+            // Scope candidates to students enrolled in any class that teacher
+            // owns for the same academic year, rather than requiring enrollment
+            // in the new subject first.
+            conditions.push(exists(
+                db.select({ id: enrollments.studentId })
+                    .from(enrollments)
+                    .innerJoin(classes, eq(enrollments.classId, classes.id))
+                    .where(and(
+                        eq(enrollments.studentId, req.user!.id!),
+                        eq(classes.teacherId, req.user!.id!),
+                        targetClass.academicYearId === null
+                            ? sql`true`
+                            : eq(classes.academicYearId, targetClass.academicYearId),
+                    ))
+            ));
+        }
         if (search) {
             conditions.push(
                 or(

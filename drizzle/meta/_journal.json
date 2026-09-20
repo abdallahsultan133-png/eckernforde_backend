@@ -106,6 +106,111 @@
       "when": 1789646400000,
       "tag": "0014_repair_adopted_feature_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789732800000,
+      "tag": "0015_repair_subject_codes",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790035200000,
+      "tag": "0016_portal_contexts",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790121600000,
+      "tag": "0017_repair_legacy_academic_years",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790208000000,
+      "tag": "0018_seed_2026_2027_academic_year",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790294400000,
+      "tag": "0019_normalize_active_academic_year",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790380800000,
+      "tag": "0020_seed_2027_2028_academic_year",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790467200000,
+      "tag": "0021_assign_legacy_classes_to_2026_2027",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1790553600000,
+      "tag": "0022_report_card_templates",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790640000000,
+      "tag": "0023_seed_active_midterm",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790726400000,
+      "tag": "0024_repair_exam_results_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790812800000,
+      "tag": "0025_repair_submissions_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790899200000,
+      "tag": "0026_repair_class_grades_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790985600000,
+      "tag": "0027_system_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1791072000000,
+      "tag": "0028_exam_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1791158400000,
+      "tag": "0029_role_login_controls",
+      "breakpoints": true
     }
   ]
 }

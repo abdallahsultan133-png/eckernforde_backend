@@ -25,9 +25,9 @@ describe("calculateSecondaryDivision", () => {
         expect(result.totalPoints).toBe(21);
         expect(result.division).toBe("II");
     });
-    it("does not award a division with fewer than seven applicable results", () => {
+    it("projects fewer than seven applicable results onto the seven-subject scale", () => {
         const result = calculateSecondaryDivision(Array.from({ length: 6 }, (_, index) => ({ subjectId: index, score: 75 })));
-        expect(result.totalPoints).toBeNull();
-        expect(result.division).toBeNull();
+        expect(result.totalPoints).toBe(11);
+        expect(result.division).toBe("I");
     });
 });

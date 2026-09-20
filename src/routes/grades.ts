@@ -1,5 +1,5 @@
 import express from "express";
-import { and, avg, desc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
+import { and, asc, avg, desc, eq, getTableColumns, ilike, inArray, or, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { academicTerms, academicYears, assignments, classGrades, classes, enrollments, examResults, exams, studentProfiles, submissions, subjects, termSubjectResults } from "../db/schema/app.js";
@@ -9,9 +9,12 @@ import { validateBody } from "../middleware/validate.js";
 import { createAcademicTermSchema, createAcademicYearSchema, createExamSchema, examResultsSchema, gradebookSaveSchema, publishTermSubjectResultsSchema, saveTermSubjectResultsSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
+import { activePortalClassIds, isInActivePortalClass } from "../lib/portal-context.js";
 import { getLinkedChildIds } from "../lib/policy.js";
 import { calculateSecondaryDivision, gradeSecondaryScore } from "../lib/grading/student-division.js";
+import { calculateStudentPosition } from "../lib/grading/student-position.js";
 import { notifyStudent } from "./notifications.js";
+import { schoolToday } from "../lib/academic-year.js";
 
 const router = express.Router();
 
@@ -36,13 +39,38 @@ router.get("/academic-years", requireAuth, async (_req, res) => {
 router.post("/academic-years", requireAuth, requireRole(...ADMIN_ROLES), validateBody(createAcademicYearSchema), async (req, res) => {
     try {
         const { name, startsOn, endsOn, active } = req.body;
-        if (active) await db.update(academicYears).set({ active: false });
-        const [created] = await db.insert(academicYears).values({ name, startsOn, endsOn, active: active ?? false }).returning();
+        if (active && (startsOn > schoolToday() || endsOn < schoolToday())) return res.status(400).json({ error: "Only a year covering today can be active. Create a future year as inactive and activate it when it begins." });
+        const created = await db.transaction(async (transaction) => {
+            if (active) await transaction.update(academicYears).set({ active: false });
+            const [year] = await transaction.insert(academicYears).values({ name, startsOn, endsOn, active: active ?? false }).returning();
+            return year;
+        });
         await logAction({ req, action: "academic-year.create", resource: "academic_years", resourceId: created?.id, details: `Created academic year ${name}` });
         res.status(201).json({ data: created });
     } catch (e) {
         console.error("POST /grades/academic-years error:", e);
         res.status(500).json({ error: "Failed to create academic year" });
+    }
+});
+
+router.patch("/academic-years/:id/activate", requireAuth, requireRole(...ADMIN_ROLES), async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: "Choose a valid academic year." });
+        const [year] = await db.select().from(academicYears).where(eq(academicYears.id, id));
+        if (!year) return res.status(404).json({ error: "Academic year not found." });
+        const today = schoolToday();
+        if (year.startsOn > today || year.endsOn < today) return res.status(400).json({ error: "This year cannot be activated outside its configured dates." });
+        const activated = await db.transaction(async (transaction) => {
+            await transaction.update(academicYears).set({ active: false });
+            const [current] = await transaction.update(academicYears).set({ active: true }).where(eq(academicYears.id, id)).returning();
+            return current;
+        });
+        await logAction({ req, action: "academic-year.activate", resource: "academic_years", resourceId: id, details: `Activated academic year ${year.name}` });
+        return res.json({ data: activated });
+    } catch (error) {
+        console.error("PATCH /grades/academic-years/:id/activate error:", error);
+        return res.status(500).json({ error: "Failed to activate academic year" });
     }
 });
 
@@ -78,6 +106,7 @@ router.post("/term-results", requireAuth, requireRole(...STAFF_ROLES), validateB
     try {
         const { academicTermId, classId, records } = req.body;
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) return policy.forbidden(res, "You can only record results for classes you teach.");
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) return policy.forbidden(res, "This class is outside your selected portal context.");
 
         const [[term], [course], roster] = await Promise.all([
             db.select({ id: academicTerms.id }).from(academicTerms).where(eq(academicTerms.id, academicTermId)),
@@ -91,10 +120,10 @@ router.post("/term-results", requireAuth, requireRole(...STAFF_ROLES), validateB
         if (records.some((record: { studentId: string }) => !enrolled.has(record.studentId))) return res.status(400).json({ error: "Every result must belong to an enrolled student." });
 
         const saved = await db.insert(termSubjectResults).values(records.map((record: { studentId: string; score: number; applicable?: boolean }) => ({
-            academicTermId, classId, subjectId: course.subjectId, studentId: record.studentId, schoolLevel: course.schoolLevel, score: record.score, applicable: record.applicable ?? true, published: false, enteredBy: req.user!.id!,
+            academicTermId, classId, subjectId: course.subjectId, studentId: record.studentId, schoolLevel: course.schoolLevel, score: record.score, applicable: record.applicable ?? true, published: true, enteredBy: req.user!.id!,
         }))).onConflictDoUpdate({
             target: [termSubjectResults.academicTermId, termSubjectResults.classId, termSubjectResults.studentId],
-            set: { score: sql`excluded.score`, applicable: sql`excluded.applicable`, schoolLevel: sql`excluded.school_level`, published: false, enteredBy: req.user!.id!, updatedAt: new Date() },
+            set: { score: sql`excluded.score`, applicable: sql`excluded.applicable`, schoolLevel: sql`excluded.school_level`, published: true, enteredBy: req.user!.id!, updatedAt: new Date() },
         }).returning();
         await logAction({ req, action: "term-results.save", resource: "term_subject_results", resourceId: classId, details: `Saved ${records.length} ${course.schoolLevel} term result(s)` });
         res.json({ data: saved });
@@ -140,6 +169,7 @@ router.get("/term-results/class/:classId", requireAuth, requireRole(...STAFF_ROL
         const academicTermId = Number(req.query.academicTermId);
         if (!Number.isInteger(classId) || !Number.isInteger(academicTermId)) return res.status(400).json({ error: "Valid classId and academicTermId are required" });
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) return policy.forbidden(res, "You can only view results for classes you teach.");
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) return policy.forbidden(res, "This class is outside your selected portal context.");
         const rows = await db.select({ ...getTableColumns(termSubjectResults), student: { id: user.id, name: user.name, email: user.email } })
             .from(termSubjectResults).innerJoin(user, eq(termSubjectResults.studentId, user.id))
             .where(and(eq(termSubjectResults.academicTermId, academicTermId), eq(termSubjectResults.classId, classId))).orderBy(user.name);
@@ -156,16 +186,84 @@ router.get("/term-results/:studentId", requireAuth, async (req, res) => {
         const academicTermId = Number(req.query.academicTermId);
         if (!Number.isInteger(academicTermId) || academicTermId <= 0) return res.status(400).json({ error: "academicTermId is required" });
         if (!(await policy.canAccessStudent(req.user!, studentId))) return policy.forbidden(res);
-        const [term, rows] = await Promise.all([
-            db.select().from(academicTerms).where(eq(academicTerms.id, academicTermId)).then((result) => result[0]),
-            db.select({ ...getTableColumns(termSubjectResults), subject: { id: subjects.id, name: subjects.name, code: subjects.code }, class: { id: classes.id, name: classes.name } })
-                .from(termSubjectResults).innerJoin(subjects, eq(termSubjectResults.subjectId, subjects.id)).innerJoin(classes, eq(termSubjectResults.classId, classes.id))
-                .where(and(eq(termSubjectResults.academicTermId, academicTermId), eq(termSubjectResults.studentId, studentId), eq(termSubjectResults.published, true))).orderBy(subjects.name),
-        ]);
+        const [term] = await db.select().from(academicTerms).where(eq(academicTerms.id, academicTermId));
         if (!term) return res.status(404).json({ error: "Academic term not found" });
-        const secondary = rows.filter((row) => row.schoolLevel === "secondary");
-        const division = term.type === "terminal" && secondary.length > 0 ? calculateSecondaryDivision(secondary.map((row) => ({ subjectId: row.subjectId, score: row.score, applicable: row.applicable }))) : null;
-        res.json({ data: rows, term: { id: term.id, name: term.name, type: term.type }, division });
+
+        const rows = await db.select({ ...getTableColumns(termSubjectResults), subject: { id: subjects.id, name: subjects.name, code: subjects.code }, class: { id: classes.id, name: classes.name } })
+            .from(termSubjectResults).innerJoin(subjects, eq(termSubjectResults.subjectId, subjects.id)).innerJoin(classes, eq(termSubjectResults.classId, classes.id))
+            .where(and(eq(termSubjectResults.academicTermId, academicTermId), eq(termSubjectResults.studentId, studentId), eq(termSubjectResults.published, true))).orderBy(subjects.name);
+
+        // Older teacher workflows stored marks as exam_results instead of the
+        // newer formal term_subject_results records. Keep those real marks
+        // visible in the report while schools migrate to formal entry: exam
+        // examType identifies Midterm vs Annual/Terminal and scores are
+        // normalized to percentages using each exam's max score. Keep the
+        // title checks for older rows created before examType was introduced.
+        const legacyRows = rows.length > 0 ? [] : await db.select({
+            id: examResults.id,
+            academicTermId: sql<number>`${academicTermId}`,
+            classId: exams.classId,
+            subjectId: classes.subjectId,
+            studentId: examResults.studentId,
+            schoolLevel: classes.schoolLevel,
+            score: sql<number>`round((${examResults.score}::numeric / nullif(${exams.maxScore}, 0)) * 100, 2)`.mapWith(Number),
+            applicable: sql<boolean>`true`.mapWith(Boolean),
+            published: sql<boolean>`true`.mapWith(Boolean),
+            enteredBy: exams.createdBy,
+            createdAt: examResults.createdAt,
+            updatedAt: examResults.updatedAt,
+            subject: { id: subjects.id, name: subjects.name, code: subjects.code },
+            class: { id: classes.id, name: classes.name },
+        })
+            .from(examResults)
+            .innerJoin(exams, eq(examResults.examId, exams.id))
+            .innerJoin(classes, eq(exams.classId, classes.id))
+            .innerJoin(subjects, eq(classes.subjectId, subjects.id))
+            .where(and(
+                eq(examResults.studentId, studentId),
+                term.type === "midterm"
+                    ? or(eq(exams.examType, "midterm"), ilike(exams.title, "%midterm%"))
+                    : or(eq(exams.examType, "annual"), ilike(exams.title, "%annual%"), ilike(exams.title, "%terminal%")),
+            ))
+            .orderBy(subjects.name, desc(exams.scheduledAt), desc(exams.createdAt), desc(examResults.createdAt));
+        // A student should have one mark per subject and term. Older exam
+        // workflows could leave multiple exam rows for the same subject; the
+        // ordered query above makes the newest mark authoritative for the
+        // report and prevents repeated subjects.
+        const reportRows = rows.length > 0
+            ? rows
+            : Array.from(new Map(legacyRows.map((row) => [row.subjectId, row])).values());
+        const secondary = reportRows.some((row) => row.schoolLevel === "secondary");
+        // Position is based only on published formal marks in the same report
+        // subjects. Legacy marks remain visible, but cannot be fairly ranked
+        // until the cohort has been moved to formal term results.
+        const positionClassIds = rows.length > 0
+            ? rows.filter((row) => row.applicable).map((row) => row.classId)
+            : legacyRows.filter((row) => row.applicable).map((row) => row.classId);
+        const cohortRows = rows.length > 0
+            ? await db.select({ studentId: termSubjectResults.studentId, classId: termSubjectResults.classId, score: termSubjectResults.score, applicable: termSubjectResults.applicable, schoolLevel: termSubjectResults.schoolLevel })
+                .from(termSubjectResults)
+                .where(and(eq(termSubjectResults.academicTermId, academicTermId), eq(termSubjectResults.published, true), inArray(termSubjectResults.classId, positionClassIds)))
+            : positionClassIds.length > 0
+                ? (await db.select({ studentId: examResults.studentId, classId: exams.classId, score: sql<number>`round((${examResults.score}::numeric / nullif(${exams.maxScore}, 0)) * 100, 2)`.mapWith(Number), applicable: sql<boolean>`true`.mapWith(Boolean), schoolLevel: classes.schoolLevel, examId: exams.id, markedAt: examResults.createdAt })
+                    .from(examResults)
+                    .innerJoin(exams, eq(examResults.examId, exams.id))
+                    .innerJoin(classes, eq(exams.classId, classes.id))
+                    .where(and(
+                        inArray(exams.classId, positionClassIds),
+                        term.type === "midterm"
+                            ? or(eq(exams.examType, "midterm"), ilike(exams.title, "%midterm%"))
+                            : or(eq(exams.examType, "annual"), ilike(exams.title, "%annual%"), ilike(exams.title, "%terminal%")),
+                    ))
+                    .orderBy(desc(examResults.createdAt))).filter((row, index, all) => all.findIndex((candidate) => candidate.studentId === row.studentId && candidate.classId === row.classId) === index)
+                : [];
+        const position = calculateStudentPosition(studentId, positionClassIds, cohortRows, secondary);
+        // Each published paper is reported independently.  Secondary division is
+        // calculated from that paper's marks so the midterm and terminal papers
+        // can legitimately have different divisions.
+        const secondaryRows = reportRows.filter((row) => row.schoolLevel === "secondary");
+        const division = secondaryRows.length > 0 ? calculateSecondaryDivision(secondaryRows.map((row) => ({ subjectId: row.subjectId, score: row.score, applicable: row.applicable }))) : null;
+        res.json({ data: reportRows, term: { id: term.id, name: term.name, type: term.type }, division, position });
     } catch (e) {
         console.error("GET /grades/term-results/:studentId error:", e);
         res.status(500).json({ error: "Failed to load term results" });
@@ -183,6 +281,11 @@ router.get("/exams", requireAuth, async (req, res) => {
         // teacher's. Admins, parents, and super_admins see everything.
         const teacherScope = policy.teacherClassScope(req.user!);
         if (teacherScope) conditions.push(teacherScope);
+        const caller = req.user!;
+        if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
+            const selectedClassIds = await activePortalClassIds({ ...caller, id: caller.id });
+            if (selectedClassIds) conditions.push(selectedClassIds.length ? inArray(exams.classId, selectedClassIds) : sql`false`);
+        }
 
         const list = await db
             .select({
@@ -206,18 +309,22 @@ router.get("/exams", requireAuth, async (req, res) => {
 // POST /api/grades/exams — teacher/admin
 router.post("/exams", requireAuth, requireRole(...STAFF_ROLES), validateBody(createExamSchema), async (req, res) => {
     try {
-        const { classId, title, description, scheduledAt, durationMinutes, maxScore, venue } = req.body as {
-            classId: number; title: string; description?: string | null;
+        const { classId, title, examType, description, scheduledAt, durationMinutes, maxScore, venue } = req.body as {
+            classId: number; title: string; examType: "midterm" | "annual"; description?: string | null;
             scheduledAt?: string | null; durationMinutes?: number | null; maxScore?: number; venue?: string | null;
         };
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only create exams for classes you teach.");
         }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
+        }
 
         const [created] = await db.insert(exams).values({
             classId,
             title: title.trim(),
+            examType,
             description: description ?? null,
             scheduledAt: scheduledAt ? new Date(scheduledAt) : null,
             durationMinutes: durationMinutes ?? null,
@@ -298,12 +405,32 @@ router.post("/exams/:examId/results", requireAuth, requireRole(...STAFF_ROLES), 
         const examId = Number(req.params.examId);
         const { records } = req.body as { records: Array<{ studentId: string; score: number; remarks?: string | null }> };
 
+        const [exam] = await db
+            .select({ classId: exams.classId, maxScore: exams.maxScore })
+            .from(exams)
+            .where(eq(exams.id, examId));
+        if (!exam) return res.status(404).json({ error: "Exam not found" });
+
         if (policy.isTeacher(req.user!)) {
-            const [exam] = await db.select({ classId: exams.classId }).from(exams).where(eq(exams.id, examId));
-            if (!exam) return res.status(404).json({ error: "Exam not found" });
             if (!(await policy.canManageClass(req.user!, exam.classId))) {
                 return policy.forbidden(res, "You can only grade exams for classes you teach.");
             }
+        }
+
+        const studentIds = records.map((record) => record.studentId);
+        if (new Set(studentIds).size !== studentIds.length) {
+            return res.status(400).json({ error: "Each student can only appear once in a save." });
+        }
+        const invalidScore = records.find((record) => record.score > exam.maxScore);
+        if (invalidScore) {
+            return res.status(400).json({ error: `Scores cannot exceed this exam's maximum of ${exam.maxScore}.` });
+        }
+        const enrolledRows = await db
+            .select({ studentId: enrollments.studentId })
+            .from(enrollments)
+            .where(and(eq(enrollments.classId, exam.classId), inArray(enrollments.studentId, studentIds)));
+        if (enrolledRows.length !== studentIds.length) {
+            return res.status(400).json({ error: "Every result must belong to a student enrolled in this exam's class." });
         }
 
         const gradedBy = req.user!.id!;
@@ -342,6 +469,9 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only view the gradebook for classes you teach.");
         }
+        if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
+        }
 
         if (policy.isStudent(req.user!) && !(await policy.isEnrolledInClass(req.user!.id!, classId))) {
             return policy.forbidden(res, "You're not enrolled in this class.");
@@ -355,7 +485,7 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             }
         }
 
-        const [roster, assignmentAvgs, examAvgs, savedGrades] = await Promise.all([
+        const [roster, assignmentAvgs, submissionCounts, assignmentCountRows, assignmentDetails, assignmentSubmissions, examAvgs, savedGrades] = await Promise.all([
             // All enrolled students
             db
                 .select({ studentId: user.id, name: user.name, email: user.email, image: user.image })
@@ -373,6 +503,44 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                 .where(and(eq(assignments.classId, classId), eq(submissions.status, "graded")))
                 .groupBy(submissions.studentId),
+            // Submitted work (graded or awaiting grading). This is deliberately
+            // separate from the average above: a submitted-but-ungraded task is
+            // not an F, while no submission for an assigned task is.
+            db
+                .select({ studentId: submissions.studentId, count: sql<number>`count(*)`.mapWith(Number) })
+                .from(submissions)
+                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .where(and(eq(assignments.classId, classId), inArray(submissions.status, ["submitted", "graded"])))
+                .groupBy(submissions.studentId),
+            db
+                .select({ count: sql<number>`count(*)`.mapWith(Number) })
+                .from(assignments)
+                .where(eq(assignments.classId, classId)),
+            // The gradebook is the complete subject record, not a recent-work
+            // feed. Return every assignment for this class in chronological
+            // order so teachers can review every question in one place.
+            db
+                .select({
+                    id: assignments.id,
+                    title: assignments.title,
+                    description: assignments.description,
+                    dueAt: assignments.dueAt,
+                    maxScore: assignments.maxScore,
+                    createdAt: assignments.createdAt,
+                })
+                .from(assignments)
+                .where(eq(assignments.classId, classId))
+                .orderBy(asc(assignments.createdAt)),
+            db
+                .select({
+                    assignmentId: submissions.assignmentId,
+                    studentId: submissions.studentId,
+                    status: submissions.status,
+                    score: submissions.score,
+                })
+                .from(submissions)
+                .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                .where(eq(assignments.classId, classId)),
             // Exam averages
             db
                 .select({
@@ -391,6 +559,8 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
         ]);
 
         const aMap = Object.fromEntries(assignmentAvgs.map((r) => [r.studentId, Math.round(Number(r.avg) || 0)]));
+        const submittedMap = Object.fromEntries(submissionCounts.map((r) => [r.studentId, Number(r.count) || 0]));
+        const hasAssignments = Number(assignmentCountRows[0]?.count ?? 0) > 0;
         const eMap = Object.fromEntries(examAvgs.map((r) => [r.studentId, Math.round(Number(r.avg) || 0)]));
         const gMap = Object.fromEntries(savedGrades.map((r) => [r.studentId, r]));
 
@@ -398,6 +568,7 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             const assignmentAvg = aMap[s.studentId] ?? null;
             const examAvg = eMap[s.studentId] ?? null;
             const saved = gMap[s.studentId];
+            const missingAssignmentSubmission = hasAssignments && !submittedMap[s.studentId];
 
             // Weighted: 40% assignments, 60% exams (if both exist); otherwise whichever is available
             let computed: number | null = null;
@@ -409,17 +580,21 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
                 computed = examAvg;
             }
 
-            const finalGrade = saved?.finalGrade ?? computed;
-            const letter = finalGrade !== null ? toLetterGrade(finalGrade) : null;
+            // A saved C/D grade must never make missing assignment work appear
+            // passed. Keep the stored grade intact for audit purposes, but show
+            // this live gradebook row as -- / F until work is submitted.
+            const finalGrade = missingAssignmentSubmission ? null : (saved?.finalGrade ?? computed);
+            const letter = missingAssignmentSubmission ? "F" : finalGrade !== null ? toLetterGrade(finalGrade) : null;
             return {
                 studentId: s.studentId,
                 name: s.name,
                 email: s.email,
                 image: s.image,
                 assignmentAvg,
+                missingAssignmentSubmission,
                 examAvg,
                 finalGrade,
-                letterGrade: saved?.letterGrade ?? letter,
+                letterGrade: missingAssignmentSubmission ? "F" : (saved?.letterGrade ?? letter),
                 remarks: saved?.remarks ?? null,
                 isOverridden: !!saved?.gradedBy,
             };
@@ -433,7 +608,7 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
                 ? gradebook.filter((row) => childIds.includes(row.studentId))
                 : gradebook;
 
-        res.json({ data: visible });
+        res.json({ data: visible, assignments: assignmentDetails, submissions: assignmentSubmissions });
     } catch (e) {
         console.error("GET /grades/gradebook/:classId error:", e);
         res.status(500).json({ error: "Failed to load gradebook" });
@@ -450,6 +625,9 @@ router.post("/gradebook/:classId/save", requireAuth, requireRole(...STAFF_ROLES)
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only save grades for classes you teach.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const gradedBy = req.user!.id!;

@@ -1,5 +1,5 @@
 import express from "express";
-import {and, desc, eq, getTableColumns, ilike, or, sql} from "drizzle-orm";
+import {and, desc, eq, exists, getTableColumns, ilike, inArray, or, sql} from "drizzle-orm";
 
 import {db} from "../db/index.js";
 import {classes, departments, subjects, enrollments} from '../db/schema/app.js'
@@ -9,6 +9,7 @@ import { validateBody } from "../middleware/validate.js";
 import { createClassSchema, updateClassSchema, enrollSchema, joinClassSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
+import { activePortalClassIds, currentAcademicYear } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -60,7 +61,7 @@ router.post('/join', requireAuth, requireRole("student"), validateBody(joinClass
 // Get all classes with optional search, filtering and pagination
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { search, subject, teacher, page = 1, limit = 10 } = req.query;
+        const { search, subject, teacher, mine, page = 1, limit = 10 } = req.query;
 
         const currentPage = Math.max(1, parseInt(String(page), 10) || 1);
         const limitPerPage = Math.min(Math.max(1, parseInt(String(limit), 10) || 10), 100); // Max 100 records per page
@@ -95,6 +96,33 @@ router.get("/", requireAuth, async (req, res) => {
         // teach; admins, parents, students see the full catalogue.
         const scope = policy.teacherClassScope(req.user!);
         if (scope) filterConditions.push(scope);
+
+        // Once a teacher or student has selected their annual form/class, all
+        // portal class lists stay within that context. Administrators retain
+        // their school-wide catalogue and existing legacy users keep the old
+        // policy until they complete setup.
+        const caller = req.user!;
+        if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
+            const selectedClassIds = await activePortalClassIds({ ...caller, id: caller.id });
+            if (selectedClassIds) {
+                if (selectedClassIds.length === 0) return res.json({ data: [], pagination: { page: currentPage, limit: limitPerPage, total: 0, totalPages: 0 } });
+                filterConditions.push(inArray(classes.id, selectedClassIds));
+            }
+        }
+
+        // The catalogue remains broad for students so they can discover and
+        // join classes. Dashboard widgets opt into this narrower scope when
+        // they specifically ask for "my classes".
+        if (mine === "1" && policy.isStudent(req.user!)) {
+            filterConditions.push(exists(
+                db.select({ classId: enrollments.classId })
+                    .from(enrollments)
+                    .where(and(
+                        eq(enrollments.classId, classes.id),
+                        eq(enrollments.studentId, req.user!.id!),
+                    )),
+            ));
+        }
 
         // Combine all filters using AND if any exist
         const whereClause = filterConditions.length > 0 ? and(...filterConditions) : undefined;
@@ -166,6 +194,17 @@ router.get('/:id', requireAuth, async (req, res) => {
 
     if(!classDetails) return res.status(404).json({ error: 'No Class found.' });
 
+    if (policy.isTeacher(req.user!)) {
+        const selected = await activePortalClassIds({ ...req.user!, id: req.user!.id! });
+        if (!(await policy.canManageClass(req.user!, classId)) || (selected !== null && !selected.includes(classId))) {
+            return policy.forbidden(res, "You can only view classes in your selected teaching context.");
+        }
+    } else if (policy.isStudent(req.user!)) {
+        if (!(await policy.isEnrolledInClass(req.user!.id!, classId))) {
+            return policy.forbidden(res, "You are not enrolled in this class.");
+        }
+    }
+
     res.status(200).json({ data: classDetails });
 })
 
@@ -175,15 +214,18 @@ router.post('/', requireAuth, requireRole(...STAFF_ROLES), validateBody(createCl
         // teacherId is ignored for that role so they can't assign a class to
         // (or see it show up under) another teacher. Admins may assign anyone.
         const teacherId = policy.isTeacher(req.user!) ? req.user!.id! : req.body.teacherId;
-        const { name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, schoolLevel } = req.body as {
+        const { name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, schoolLevel, academicYearId } = req.body as {
             name: string; subjectId: number; description?: string | null; capacity?: number;
             bannerUrl?: string | null; bannerCldPubId?: string | null; status?: "active" | "inactive" | "archived";
             schoolLevel?: "nursery" | "primary" | "secondary" | null;
+            academicYearId?: number | null;
         };
+
+        const activeYear = academicYearId === undefined ? await currentAcademicYear() : null;
 
         const [createdClass] = await db
             .insert(classes)
-            .values({ name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, ...(policy.isAdmin(req.user!) ? { schoolLevel } : {}), teacherId, inviteCode: Math.random().toString(36).substring(2, 9), schedules: [] })
+            .values({ name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, ...(policy.isAdmin(req.user!) ? { schoolLevel, academicYearId: academicYearId ?? activeYear?.id ?? null } : { academicYearId: activeYear?.id ?? null }), teacherId, inviteCode: Math.random().toString(36).substring(2, 9), schedules: [] })
             .returning({ id: classes.id });
 
         if(!createdClass) throw Error;
@@ -208,11 +250,12 @@ router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(update
             return policy.forbidden(res, "You can only edit classes you teach.");
         }
 
-        const { name, subjectId, teacherId, description, capacity, bannerUrl, bannerCldPubId, status, schoolLevel } = req.body as {
+        const { name, subjectId, teacherId, description, capacity, bannerUrl, bannerCldPubId, status, schoolLevel, academicYearId } = req.body as {
             name?: string; subjectId?: number; teacherId?: string; description?: string | null;
             capacity?: number; bannerUrl?: string | null; bannerCldPubId?: string | null;
             status?: "active" | "inactive" | "archived";
             schoolLevel?: "nursery" | "primary" | "secondary" | null;
+            academicYearId?: number | null;
         };
 
         // Only an admin may reassign a class to a different teacher — a
@@ -231,6 +274,7 @@ router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(update
                 ...(bannerCldPubId !== undefined ? { bannerCldPubId } : {}),
                 ...(status !== undefined ? { status } : {}),
                 ...(schoolLevel !== undefined && isAdmin ? { schoolLevel } : {}),
+                ...(academicYearId !== undefined && isAdmin ? { academicYearId } : {}),
             })
             .where(eq(classes.id, classId))
             .returning();

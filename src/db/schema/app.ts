@@ -33,6 +33,17 @@ export const departments = pgTable('departments', {
     ...timestamps
 });
 
+// Singleton switch controlled by super administrators. When disabled, the
+// system middleware blocks authenticated portal requests for every other role.
+export const systemSettings = pgTable('system_settings', {
+    id: integer('id').primaryKey().default(1),
+    enabled: boolean('enabled').notNull().default(true),
+    teachersEnabled: boolean('teachers_enabled').notNull().default(true),
+    studentsParentsEnabled: boolean('students_parents_enabled').notNull().default(true),
+    updatedBy: text('updated_by').references(() => user.id, { onDelete: 'set null' }),
+    ...timestamps,
+});
+
 export const subjects = pgTable('subjects', {
     id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
     departmentId: integer('department_id').notNull().references(() => departments.id, { onDelete: 'restrict' }),
@@ -63,11 +74,15 @@ export const classes = pgTable('classes', {
     // Administrative classification used by formal reporting. Results derive
     // their level from this server-stored value; teachers never supply it.
     schoolLevel: schoolLevelEnum('school_level'),
+    // A class belongs to one academic year. Existing legacy classes may be
+    // unassigned until an administrator classifies them during rollover.
+    academicYearId: integer('academic_year_id').references(() => academicYears.id, { onDelete: 'restrict' }),
     schedules: jsonb('schedules').$type<any[]>().default([]).notNull(),
     ...timestamps
 }, (table) => [
     index('classes_subject_id_idx').on(table.subjectId),
     index('classes_teacher_id_idx').on(table.teacherId),
+    index('classes_academic_year_id_idx').on(table.academicYearId),
 ]);
 
 export const enrollments = pgTable('enrollments', {
@@ -164,6 +179,7 @@ export const exams = pgTable('exams', {
     classId: integer('class_id').notNull().references(() => classes.id, { onDelete: 'cascade' }),
     createdBy: text('created_by').notNull().references(() => user.id, { onDelete: 'restrict' }),
     title: varchar('title', { length: 255 }).notNull(),
+    examType: varchar('exam_type', { length: 20 }).default('midterm').notNull(),
     description: text('description'),
     scheduledAt: timestamp('scheduled_at'),
     durationMinutes: integer('duration_minutes'),
@@ -219,6 +235,42 @@ export const academicYears = pgTable('academic_years', {
     startsOn: text('starts_on').notNull(),
     endsOn: text('ends_on').notNull(),
     active: boolean('active').default(false).notNull(),
+    ...timestamps,
+});
+
+// The selected school band and stage is a portal context, not an enrollment.
+// A student has one immutable context per academic year; teachers may update
+// theirs to move between forms they teach. Historical rows preserve the
+// context needed to revisit a previous year's record.
+export const portalContexts = pgTable('portal_contexts', {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    userId: text('user_id').notNull().references(() => user.id, { onDelete: 'cascade' }),
+    academicYearId: integer('academic_year_id').notNull().references(() => academicYears.id, { onDelete: 'restrict' }),
+    schoolBand: varchar('school_band', { length: 20 }).notNull(),
+    stage: varchar('stage', { length: 30 }).notNull(),
+    ...timestamps,
+}, (table) => [
+    unique('portal_contexts_user_year_unique').on(table.userId, table.academicYearId),
+    index('portal_contexts_user_id_idx').on(table.userId),
+    index('portal_contexts_academic_year_id_idx').on(table.academicYearId),
+]);
+
+// One live, administrator-controlled report-card presentation for the school.
+// Assessment data remains in term_subject_results; this table only stores the
+// document identity and display settings applied to every student report.
+export const reportCardTemplates = pgTable('report_card_templates', {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    name: varchar('name', { length: 120 }).notNull(),
+    schoolName: varchar('school_name', { length: 255 }).notNull(),
+    schoolAddress: text('school_address'),
+    headmasterName: varchar('headmaster_name', { length: 255 }),
+    headmasterSignature: text('headmaster_signature'),
+    logoUrl: text('logo_url'),
+    accentColor: varchar('accent_color', { length: 7 }).notNull().default('#0f4c5c'),
+    showAttendance: boolean('show_attendance').notNull().default(true),
+    showRemarks: boolean('show_remarks').notNull().default(true),
+    showDivision: boolean('show_division').notNull().default(true),
+    updatedBy: text('updated_by').references(() => user.id, { onDelete: 'set null' }),
     ...timestamps,
 });
 

@@ -1,12 +1,14 @@
 import express from "express";
-import { and, eq, gte, lte, getTableColumns, desc, or, ne, isNull } from "drizzle-orm";
+import { and, eq, gte, lte, getTableColumns, desc, or, ne, isNull, inArray, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
-import { calendarEvents, classes, assignments, exams } from "../db/schema/app.js";
+import { calendarEvents, classes, assignments, exams, enrollments } from "../db/schema/app.js";
+import * as policy from "../lib/policy.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createCalendarEventSchema, updateCalendarEventSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
+import { activePortalClassIds } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -137,6 +139,31 @@ router.get("/", requireAuth, async (req, res) => {
         if (from && DATE_RE.test(from)) assignConditions.push(gte(assignments.dueAt, new Date(from)));
         if (to && DATE_RE.test(to)) assignConditions.push(lte(assignments.dueAt, new Date(to + "T23:59:59")));
         if (classId) assignConditions.push(eq(assignments.classId, Number(classId)));
+
+        if (!policy.isAdmin(req.user!)) {
+            let allowedIds: number[] = [];
+            if (policy.isTeacher(req.user!)) {
+                allowedIds = (await db.select({ id: classes.id }).from(classes)
+                    .where(eq(classes.teacherId, req.user!.id!))).map(row => row.id);
+            } else {
+                const studentIds = policy.isStudent(req.user!) ? [req.user!.id!]
+                    : policy.isParent(req.user!) ? await policy.getLinkedChildIds({ id: req.user!.id!, email: req.user!.email }) : [];
+                if (studentIds.length) {
+                    allowedIds = (await db.select({ id: enrollments.classId }).from(enrollments)
+                        .where(inArray(enrollments.studentId, studentIds))).map(row => row.id);
+                }
+            }
+            // Form/class events follow the active portal context. School-wide
+            // events (with no class) remain visible to everyone.
+            if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!))) {
+                const selectedClassIds = await activePortalClassIds({ ...req.user!, id: req.user!.id });
+                if (selectedClassIds) allowedIds = allowedIds.filter((id) => selectedClassIds.includes(id));
+            }
+            conditions.push(or(isNull(calendarEvents.classId), allowedIds.length
+                ? inArray(calendarEvents.classId, allowedIds) : sql`false`)!);
+            examConditions.push(allowedIds.length ? inArray(exams.classId, allowedIds) : sql`false`);
+            assignConditions.push(allowedIds.length ? inArray(assignments.classId, allowedIds) : sql`false`);
+        }
 
         const [rawEvents, examEvents, deadlines] = await Promise.all([
             db

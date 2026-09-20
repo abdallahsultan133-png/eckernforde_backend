@@ -43,6 +43,14 @@ export function calculateSecondaryDivision(results: ApplicableSubjectResult[]) {
         })
         .sort((a, b) => a.points - b.points || b.score - a.score);
     const bestSeven = subjects.slice(0, 7);
-    const totalPoints = bestSeven.length === 7 ? bestSeven.reduce((sum, result) => sum + result.points, 0) : null;
+    // A complete secondary result uses the seven best subjects. When fewer
+    // subjects are available, each missing subject counts as F (5 points) so
+    // the division still uses the official seven-subject 7–35 scale.
+    const rawPoints = bestSeven.reduce((sum, result) => sum + result.points, 0);
+    const totalPoints = bestSeven.length === 0
+        ? null
+        : bestSeven.length < 7
+            ? rawPoints + ((7 - bestSeven.length) * 5)
+            : rawPoints;
     return { subjects, bestSeven, totalPoints, division: totalPoints === null ? null : divisionForPoints(totalPoints) };
 }

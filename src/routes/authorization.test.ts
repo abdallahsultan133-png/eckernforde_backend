@@ -25,10 +25,12 @@
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import express from "express";
+import { PgDialect } from "drizzle-orm/pg-core";
+import type { SQL } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── DB mock ──────────────────────────────────────────────────────────────────
-const dbState = vi.hoisted(() => ({ queue: [] as unknown[] }));
+const dbState = vi.hoisted(() => ({ queue: [] as unknown[], predicates: [] as SQL[] }));
 
 vi.mock("../db/index.js", () => {
     const pull = (fallback: unknown) => (dbState.queue.length ? dbState.queue.shift() : fallback);
@@ -39,6 +41,7 @@ vi.mock("../db/index.js", () => {
     const chain = (fallback: unknown): any =>
         new Proxy(function () {}, {
             get(_target, prop) {
+                if (prop === "where") return (predicate: SQL) => { if (predicate) dbState.predicates.push(predicate); return chain(fallback); };
                 if (prop === "then") {
                     return (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) =>
                         Promise.resolve(pull(fallback)).then(ok, err);
@@ -55,6 +58,10 @@ vi.mock("../db/index.js", () => {
             update: () => chain([{ id: 1, name: "Updated", email: "updated@school.test", role: "student" }]),
             delete: () => chain([{ id: 1 }]),
             execute: async () => ({ rows: [] }),
+            transaction: async (callback: (transaction: any) => unknown) => callback({
+                update: () => chain([{ id: 1 }]),
+                insert: () => chain([{ id: 1 }]),
+            }),
         },
         pool: { on: () => undefined },
     };
@@ -74,6 +81,19 @@ vi.mock("../lib/auth.js", () => ({
     },
 }));
 
+// These route tests isolate the existing ownership and role guards. Portal
+// class selection is exercised with the real helper in portal-context.test.ts;
+// the legacy queued DB fixture here has no per-user context unless a test
+// explicitly supplies one through the portal-context router.
+vi.mock("../lib/portal-context.js", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("../lib/portal-context.js")>();
+    return {
+        ...actual,
+        activePortalClassIds: async () => null,
+        isInActivePortalClass: async () => true,
+    };
+});
+
 /** Queue the value(s) the next DB query/queries should resolve to (FIFO). */
 function queueDb(...values: unknown[]) {
     dbState.queue.push(...values);
@@ -88,6 +108,10 @@ const { default: attendanceRouter } = await import("./attendance.js");
 const { default: calendarRouter } = await import("./calendar.js");
 const { default: announcementsRouter } = await import("./announcements.js");
 const { default: admissionsRouter } = await import("./admissions.js");
+const { default: aiAssistantRouter } = await import("./ai-assistant.js");
+const { default: uploadsRouter } = await import("./uploads.js");
+const { default: portalContextRouter } = await import("./portal-context.js");
+const { default: dashboardRouter } = await import("./dashboard.js");
 
 // ── Test users ───────────────────────────────────────────────────────────────
 type TestUser = { id: string; name: string; email: string; role: UserRoles };
@@ -124,6 +148,10 @@ beforeAll(async () => {
     app.use("/api/calendar", calendarRouter);
     app.use("/api/announcements", announcementsRouter);
     app.use("/api/admissions", admissionsRouter);
+    app.use("/api/ai-assistant", aiAssistantRouter);
+    app.use("/api/uploads", uploadsRouter);
+    app.use("/api/portal-context", portalContextRouter);
+    app.use("/api/dashboard", dashboardRouter);
 
     server = await new Promise<Server>((resolve) => {
         const s = app.listen(0, () => resolve(s));
@@ -135,6 +163,7 @@ afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
 beforeEach(() => {
     dbState.queue.length = 0;
+    dbState.predicates.length = 0;
 });
 
 async function call(
@@ -179,6 +208,17 @@ describe("GET /api/audit-logs — admin only", () => {
         for (const user of [USERS.admin, USERS.superAdmin]) {
             expect((await call("GET", "/api/audit-logs", { as: user })).status).toBe(200);
         }
+    });
+});
+
+describe("GET /api/dashboard/stats — role-scoped aggregates", () => {
+    it("returns student stats when the pending-assignment class scope is active", async () => {
+        // The student path fans out across several aggregate queries. Keep this
+        // smoke test close to the route so a new role-scoped query cannot make
+        // the whole dashboard fail before it returns its response.
+        const result = await call("GET", "/api/dashboard/stats", { as: USERS.student });
+        expect(result.status).toBe(200);
+        expect(result.body).toMatchObject({ students: 0, teachers: 0, classes: 0, subjects: 0 });
     });
 });
 
@@ -330,6 +370,37 @@ describe("users directory endpoints", () => {
     it("GET /api/users/teachers is any signed-in user, but not the public", async () => {
         expect((await call("GET", "/api/users/teachers")).status).toBe(401);
         expect((await call("GET", "/api/users/teachers", { as: USERS.student })).status).toBe(200);
+    });
+});
+
+describe("class list scopes", () => {
+    it("returns the student's enrolled classes for the dashboard scope", async () => {
+        queueDb(
+            [{ count: 1 }],
+            [{ id: 7, name: "Form II Mathematics", status: "active" }],
+        );
+
+        const result = await call("GET", "/api/classes?mine=1&limit=6", { as: USERS.student });
+
+        expect(result.status).toBe(200);
+        expect(result.body.data).toHaveLength(1);
+        expect(result.body.data[0]).toMatchObject({ id: 7, name: "Form II Mathematics" });
+    });
+
+    it("keeps the full class catalogue available without the dashboard scope", async () => {
+        queueDb(
+            [{ count: 2 }],
+            [
+                { id: 7, name: "Form II Mathematics", status: "active" },
+                { id: 8, name: "Form II English", status: "active" },
+            ],
+        );
+
+        const result = await call("GET", "/api/classes?limit=12", { as: USERS.student });
+
+        expect(result.status).toBe(200);
+        expect(result.body.data).toHaveLength(2);
+        expect(dbState.predicates).toHaveLength(0);
     });
 });
 
@@ -487,6 +558,25 @@ describe("attendance — marking is staff + class-scoped", () => {
     });
 });
 
+describe("calendar read scope", () => {
+    it("requires login", async () => {
+        expect((await call("GET", "/api/calendar")).status).toBe(401);
+    });
+    it.each([USERS.student, USERS.teacher])("limits $role academic events to permitted classes", async (as) => {
+        queueDb([{ id: 42 }], [], [], []);
+        expect((await call("GET", "/api/calendar", { as })).status).toBe(200);
+        const clauses = dbState.predicates.map(p => new PgDialect().sqlToQuery(p));
+        const scoped = clauses.filter(p => p.params.includes(42));
+        expect(scoped).toHaveLength(3);
+        expect(scoped.some(p => p.sql.includes('is null'))).toBe(true);
+    });
+    it("excludes all class-bound records for a parent without linked children", async () => {
+        expect((await call("GET", "/api/calendar", { as: USERS.parent })).status).toBe(200);
+        const clauses = dbState.predicates.map(p => new PgDialect().sqlToQuery(p).sql);
+        expect(clauses.filter(sql => sql.includes("false"))).toHaveLength(3);
+    });
+});
+
 describe("calendar events — add / remove is admin only", () => {
     const newEvent = { title: "Staff meeting", startAt: "2026-09-01T10:00" };
 
@@ -569,5 +659,201 @@ describe("formal term-result publication — admin only", () => {
         const result = await call("POST", "/api/grades/term-results/publish", { as: USERS.admin, body });
         expect(result.status).toBe(200);
         expect(result.body.data.published).toBe(true);
+    });
+});
+
+describe("AI student assistant — administrator only", () => {
+    const body = { message: "Find Sam Student" };
+
+    it("rejects unauthenticated and teacher access before any student lookup", async () => {
+        expect((await call("POST", "/api/ai-assistant/chat", { body })).status).toBe(401);
+        expect((await call("POST", "/api/ai-assistant/chat", { as: USERS.teacher, body })).status).toBe(403);
+        expect((await call("POST", "/api/ai-assistant/chat", { as: USERS.student, body })).status).toBe(403);
+    });
+
+    it("allows an administrator through the authorization guard", async () => {
+        // The test environment intentionally has no Anthropic key, so a 500
+        // proves the administrator reached the configured-handler boundary.
+        expect((await call("POST", "/api/ai-assistant/chat", { as: USERS.admin, body })).status).toBe(500);
+    });
+});
+
+describe("Cloudinary upload signing - authenticated and constrained", () => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const validParams = { folder: "uploads/avatars", timestamp };
+
+    it("requires authentication", async () => {
+        expect((await call("POST", "/api/uploads/sign", { body: validParams })).status).toBe(401);
+    });
+
+    it("rejects unapproved folders and unsupported parameters", async () => {
+        expect((await call("POST", "/api/uploads/sign", {
+            as: USERS.student,
+            body: { ...validParams, folder: "private/exports" },
+        })).status).toBe(400);
+        expect((await call("POST", "/api/uploads/sign", {
+            as: USERS.student,
+            body: { ...validParams, callback: "https://attacker.test" },
+        })).status).toBe(400);
+    });
+
+    it("rejects expired signing timestamps", async () => {
+        expect((await call("POST", "/api/uploads/sign", {
+            as: USERS.student,
+            body: { ...validParams, timestamp: timestamp - 60 * 60 },
+        })).status).toBe(400);
+    });
+});
+
+describe("student academic archive", () => {
+    const path = "/api/portal-context/history/7";
+
+    it("requires a student session and a saved context for the requested year", async () => {
+        expect((await call("GET", path)).status).toBe(401);
+        expect((await call("GET", path, { as: USERS.teacher })).status).toBe(403);
+        queueDb([{ id: 7, name: "2025", startsOn: "2025-01-01", endsOn: "2025-12-31" }], []);
+        expect((await call("GET", path, { as: USERS.student })).status).toBe(403);
+    });
+
+    it("keeps the current year in the live portal instead of the read-only archive", async () => {
+        const year = { id: 7, name: "Current", startsOn: "2000-01-01", endsOn: "2099-12-31", active: true };
+        queueDb([year], [{ id: 11, userId: USERS.student.id, academicYearId: 7, stage: "form_i" }], [year]);
+        expect((await call("GET", path, { as: USERS.student })).status).toBe(409);
+    });
+
+    it("does not expose an overlapping legacy year as historical", async () => {
+        const legacy = { id: 7, name: "Legacy", startsOn: "2000-08-01", endsOn: "2099-07-31", active: false };
+        const current = { id: 8, name: "2026/2027", startsOn: "2026-01-01", endsOn: "2026-12-31", active: true };
+        queueDb([legacy], [{ id: 11, userId: USERS.student.id, academicYearId: 7, stage: "form_i" }], [current]);
+        expect((await call("GET", path, { as: USERS.student })).status).toBe(409);
+        queueDb([current], [{ id: 11, academicYear: legacy, stage: "form_i" }]);
+        const list = await call("GET", "/api/portal-context/history", { as: USERS.student });
+        expect(list.status).toBe(200);
+        expect(list.body.data).toEqual([]);
+    });
+
+    it("returns only records for the student's saved year and stage", async () => {
+        queueDb(
+            [{ id: 7, name: "2025", startsOn: "2025-01-01", endsOn: "2025-12-31" }],
+            [{ id: 11, userId: USERS.student.id, academicYearId: 7, schoolBand: "secondary", stage: "form_i" }],
+            [], // No current academic year in this isolated fixture.
+            [{ id: 5, name: "Form I", academicYearId: 7, teacherId: USERS.teacher.id, subject: { id: 2, name: "Mathematics" } }],
+            [
+                { id: 21, termName: "Terminal", className: "Form I", classAcademicYearId: 7, score: 80 },
+                { id: 22, termName: "Terminal", className: "Form II", classAcademicYearId: 7, score: 80 },
+            ],
+            [{ id: 31, date: "2025-02-10", status: "present", className: "Form I", classAcademicYearId: 7 }],
+            [{ id: 41, title: "Algebra", className: "Form I", classAcademicYearId: 7 }],
+            [{ id: 51, title: "Midterm", className: "Form I", classAcademicYearId: 7 }],
+            [{ classId: 5 }],
+        );
+
+        const response = await call("GET", path, { as: USERS.student });
+        expect(response.status).toBe(200);
+        expect(response.body.data.classes).toHaveLength(1);
+        expect(response.body.data.termResults).toHaveLength(1);
+        expect(response.body.data.termResults[0].className).toBe("Form I");
+        expect(response.body.data.attendance).toHaveLength(1);
+        expect(response.body.data.assignments).toHaveLength(1);
+        expect(response.body.data.exams).toHaveLength(1);
+        const clauses = dbState.predicates.map((predicate) => new PgDialect().sqlToQuery(predicate));
+        expect(clauses.filter((clause) => clause.params.includes(USERS.student.id)).length).toBeGreaterThanOrEqual(6);
+        expect(clauses.some((clause) => clause.params.includes(7))).toBe(true);
+    });
+});
+
+describe("portal form selection across academic years", () => {
+    const currentYear = { id: 8, name: "New year", startsOn: "2000-01-01", endsOn: "2099-12-31", active: true };
+    const classes = [
+        { id: 1, name: "Form I", academicYearId: 8, teacherId: USERS.teacher.id },
+        { id: 2, name: "Form II", academicYearId: 8, teacherId: USERS.teacher.id },
+    ];
+    const body = { academicYearId: 8, schoolBand: "secondary", stage: "form_ii" };
+
+    it("does not let a student replace their selected form in the same year", async () => {
+        queueDb([currentYear], [{ id: 5, stage: "form_i" }]);
+        const response = await call("POST", "/api/portal-context", { as: USERS.student, body });
+        expect(response.status).toBe(409);
+        expect(response.body.error).toContain("correct class or form");
+    });
+
+    it("does not let a student change to a lower form during the same year", async () => {
+        queueDb([currentYear], [{ id: 5, stage: "form_ii" }]);
+        const response = await call("POST", "/api/portal-context", {
+            as: USERS.student,
+            body: { ...body, stage: "form_i" },
+        });
+        expect(response.status).toBe(409);
+        expect(response.body.error).toContain("correct class or form");
+    });
+
+    it("lets a student select their assigned form in a new year", async () => {
+        // Context selection is onboarding only; enrollment is checked later
+        // when class-scoped data is requested.
+        queueDb([currentYear], []);
+        const response = await call("POST", "/api/portal-context", { as: USERS.student, body });
+        expect(response.status).toBe(201);
+    });
+
+    it("allows only the saved stage or one promotion when a new year starts", async () => {
+        queueDb([currentYear], [], [], [], [{ stage: "form_i" }]);
+        expect((await call("POST", "/api/portal-context", { as: USERS.student, body })).status).toBe(201);
+
+        queueDb([currentYear], [], [], [], [{ stage: "form_i" }]);
+        const skipped = await call("POST", "/api/portal-context", {
+            as: USERS.student,
+            body: { ...body, stage: "form_iii" },
+        });
+        expect(skipped.status).toBe(409);
+        expect(skipped.body.error).toContain("move ahead by one stage");
+    });
+
+    it("lets a teacher move between assigned forms during one year", async () => {
+        queueDb([currentYear], classes, [{ id: 5, stage: "form_i" }]);
+        const response = await call("POST", "/api/portal-context", { as: USERS.teacher, body });
+        expect(response.status).toBe(200);
+    });
+
+    it("does not offer unassigned Legacy classes in a new academic year", async () => {
+        queueDb(
+            [currentYear],
+            [],
+            [
+                { id: 1, name: "Form I", academicYearId: null, teacherId: USERS.teacher.id },
+                { id: 2, name: "Form II", academicYearId: 8, teacherId: USERS.teacher.id },
+            ],
+            [{ classId: 1 }, { classId: 2 }],
+        );
+        const response = await call("GET", "/api/portal-context", { as: USERS.student });
+        expect(response.status).toBe(200);
+        expect(response.body.data.available.map((item: { id: number }) => item.id)).toEqual([2]);
+        expect(response.body.data.stages).toEqual(["form_ii"]);
+    });
+});
+
+describe("academic-year activation", () => {
+    const path = "/api/grades/academic-years/7/activate";
+
+    it("is restricted to administrators", async () => {
+        expect((await call("PATCH", path)).status).toBe(401);
+        expect((await call("PATCH", path, { as: USERS.teacher })).status).toBe(403);
+    });
+
+    it("activates a configured year only within its dates", async () => {
+        queueDb([{ id: 7, name: "Future", startsOn: "2099-01-01", endsOn: "2099-12-31" }]);
+        expect((await call("PATCH", path, { as: USERS.admin })).status).toBe(400);
+        queueDb([{ id: 7, name: "Current", startsOn: "2000-01-01", endsOn: "2099-12-31" }]);
+        expect((await call("PATCH", path, { as: USERS.admin })).status).toBe(200);
+    });
+
+    it("creates a future year without making it current", async () => {
+        const future = { name: "2099/2100", startsOn: "2099-01-01", endsOn: "2099-12-31" };
+        expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: { ...future, active: true } })).status).toBe(400);
+        expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: { ...future, active: false } })).status).toBe(201);
+    });
+
+    it("requires calendar-year academic dates", async () => {
+        const invalid = { name: "2099/2100", startsOn: "2099-01-02", endsOn: "2099-12-31", active: false };
+        expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: invalid })).status).toBe(400);
     });
 });

@@ -25,6 +25,7 @@ const securityMiddleware = async (req: Request, res: Response, next: NextFunctio
 
         switch (role) {
             case 'admin':
+            case 'super_admin':
                 client = CLIENTS.admin;
                 message ='Admin request limit exceeded (100 per minute). Slow down.';
                 break;
@@ -64,7 +65,10 @@ const securityMiddleware = async (req: Request, res: Response, next: NextFunctio
         next();
     } catch (e) {
         console.error('Arcjet middleware error: ', e);
-        res.status(500).json({ error: 'Internal error', message: 'Something went wrong with security middleware' });
+        // Arcjet is an external availability dependency. A transport or SDK
+        // failure must not turn every login and portal request into a 500;
+        // explicit deny decisions above still block as usual.
+        next();
     }
 }
 
