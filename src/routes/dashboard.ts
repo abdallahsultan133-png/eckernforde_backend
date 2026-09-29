@@ -338,14 +338,14 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
             ...recentAssignments.map((a) => ({
                 type: "assignment" as const,
                 id: a.id,
-                title: "Assignment published",
+                title: "Homework published",
                 description: `${a.title} (${a.className})`,
                 time: a.createdAt,
             })),
             ...recentSubmissions.map((s) => ({
                 type: "submission" as const,
                 id: s.id,
-                title: "Assignment submitted",
+                title: "Homework submitted",
                 description: `${s.studentName} submitted "${s.assignmentTitle}"`,
                 time: s.createdAt,
             })),

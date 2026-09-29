@@ -17,7 +17,7 @@ type EmailParams = {
     html: string;
 };
 
-const PRODUCT_NAME = process.env.SCHOOL_NAME?.trim() || "Your School";
+const PRODUCT_NAME = process.env.SCHOOL_NAME?.trim() || "Eckernforde Schools";
 
 // User-supplied strings (announcement content, feedback, names, titles) get
 // interpolated straight into these HTML email templates. Without escaping,
@@ -182,15 +182,15 @@ export async function sendAssignmentEmail(params: {
 
     await sendEmail({
         to: params.to,
-        subject: `New assignment: ${params.assignmentTitle} — ${params.className}`,
+        subject: `New homework: ${params.assignmentTitle} — ${params.className}`,
         html: wrap(`
-            <h2 style="margin:0 0 8px;font-size:18px;">New Assignment Posted</h2>
-            <p style="color:#475569;margin:0 0 16px;">A new assignment has been posted in <strong>${className}</strong>.</p>
+            <h2 style="margin:0 0 8px;font-size:18px;">New Homework Posted</h2>
+            <p style="color:#475569;margin:0 0 16px;">New homework has been posted in <strong>${className}</strong>.</p>
             <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:16px;">
                 <h3 style="margin:0 0 8px;font-size:16px;">${title}</h3>
                 ${due}
             </div>
-            <a href="${params.assignmentUrl}" style="${buttonStyle}">View Assignment</a>
+            <a href="${params.assignmentUrl}" style="${buttonStyle}">View Homework</a>
         `),
     });
 }
@@ -246,9 +246,9 @@ export async function sendGradeEmail(params: {
 
     await sendEmail({
         to: params.to,
-        subject: `Your assignment has been graded — ${params.assignmentTitle}`,
+        subject: `Your homework has been graded — ${params.assignmentTitle}`,
         html: wrap(`
-            <h2 style="margin:0 0 8px;font-size:18px;">Assignment Graded</h2>
+            <h2 style="margin:0 0 8px;font-size:18px;">Homework Graded</h2>
             <p style="color:#475569;margin:0 0 16px;">Hi ${studentName}, your submission for <strong>${assignmentTitle}</strong> has been graded.</p>
             <div style="text-align:center;padding:24px;background:#f8fafc;border-radius:8px;margin-bottom:16px;">
                 <p style="margin:0;font-size:48px;font-weight:800;color:${color};">${params.score}/${params.maxScore}</p>
@@ -270,7 +270,7 @@ export async function sendWelcomeEmail(params: {
         subject: `Welcome to ${PRODUCT_NAME}`,
         html: wrap(`
             <h2 style="margin:0 0 8px;font-size:18px;">Welcome, ${escapeHtml(params.name)}! 🎉</h2>
-            <p style="color:#475569;margin:0 0 16px;">Your account has been created. You can now log in and access your classes, assignments, and grades.</p>
+            <p style="color:#475569;margin:0 0 16px;">Your account has been created. You can now log in and access your classes, homework, and grades.</p>
             <p style="color:#475569;margin:0 0 16px;font-size:14px;">
                 Your account starts as a <strong>Student</strong>. An administrator can change your role if needed.
             </p>

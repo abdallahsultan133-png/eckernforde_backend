@@ -344,7 +344,7 @@ router.delete("/:id", requireAuth, requireRole(...ADMIN_ROLES), async (req, res)
                 return res.status(409).json({
                     error:
                         "This account still owns records that can't be auto-removed — classes they teach, " +
-                        "assignments, announcements, exams or calendar events they created, attendance they " +
+                        "homework, announcements, exams or calendar events they created, attendance they " +
                         "marked, or files they uploaded. Reassign or delete those first, then try again.",
                 });
             }

@@ -1,7 +1,7 @@
 import express from "express";
-import { eq, or } from "drizzle-orm";
+import { and, eq, gte, lte, or } from "drizzle-orm";
 import { db } from "../db/index.js";
-import { studentProfiles, classGrades, attendance, classes, enrollments, subjects } from "../db/schema/app.js";
+import { academicYears, studentProfiles, classGrades, attendance, classes, enrollments, subjects, termSubjectResults } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, ADMIN_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
@@ -105,9 +105,13 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
         if (!studentUser) return res.status(404).json({ error: "Student not found" });
         const [profile] = await db.select().from(studentProfiles).where(eq(studentProfiles.userId, studentId));
         const enrolledClasses = await db
-            .select({ id: classes.id, name: classes.name, subject: { id: subjects.id, name: subjects.name } })
+            .select({ id: classes.id, name: classes.name, schoolLevel: classes.schoolLevel, subject: { id: subjects.id, name: subjects.name } })
             .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).leftJoin(subjects, eq(classes.subjectId, subjects.id))
             .where(eq(enrollments.studentId, studentId));
+        const recordedLevels = await db
+            .select({ schoolLevel: termSubjectResults.schoolLevel })
+            .from(termSubjectResults)
+            .where(eq(termSubjectResults.studentId, studentId));
         const grades = await db
             .select({ classId: classGrades.classId, finalGrade: classGrades.finalGrade, letterGrade: classGrades.letterGrade })
             .from(classGrades).where(eq(classGrades.studentId, studentId));
@@ -115,6 +119,11 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
             .from(attendance).where(eq(attendance.studentId, studentId));
         const totalAtt = attendanceRows.length;
         const presentAtt = attendanceRows.filter((r) => r.status === "present").length;
+        const schoolBand = enrolledClasses.some((course) => course.schoolLevel === "secondary") || recordedLevels.some((row) => row.schoolLevel === "secondary")
+            ? "secondary"
+            : enrolledClasses.some((course) => course.schoolLevel === "primary" || course.schoolLevel === "nursery") || recordedLevels.some((row) => row.schoolLevel === "primary" || row.schoolLevel === "nursery")
+                ? "primary"
+                : null;
 
         let linkedParent = null;
         if (profile?.parentUserId) {
@@ -125,7 +134,7 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
 
         res.json({
             data: {
-                ...studentUser, profile: profile ?? null, linkedParent, enrolledClasses, grades,
+                ...studentUser, profile: profile ?? null, linkedParent, enrolledClasses, schoolBand, grades,
                 attendanceSummary: { total: totalAtt, present: presentAtt, rate: totalAtt > 0 ? Math.round((presentAtt / totalAtt) * 1000) / 10 : null },
             },
         });
@@ -175,6 +184,16 @@ router.get("/my-children", requireAuth, async (req, res) => {
     try {
         const parentId = req.user!.id!;
         const parentEmail = req.user!.email;
+        const requestedYearId = req.query.academicYearId === undefined ? null : Number(req.query.academicYearId);
+        if (requestedYearId !== null && (!Number.isInteger(requestedYearId) || requestedYearId <= 0)) {
+            return res.status(400).json({ error: "Invalid academic year" });
+        }
+        const [selectedYear] = requestedYearId === null
+            ? []
+            : await db.select().from(academicYears).where(eq(academicYears.id, requestedYearId));
+        if (requestedYearId !== null && !selectedYear) {
+            return res.status(404).json({ error: "Academic year not found" });
+        }
 
         // Primary link: an admin explicitly linked this parent account to the student
         // via PATCH /student/:studentId/link-parent. Fall back to the legacy
@@ -197,12 +216,24 @@ router.get("/my-children", requireAuth, async (req, res) => {
             const enrolledClasses = await db
                 .select({ id: classes.id, name: classes.name, subject: { id: subjects.id, name: subjects.name } })
                 .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).leftJoin(subjects, eq(classes.subjectId, subjects.id))
-                .where(eq(enrollments.studentId, childId));
+                .where(and(
+                    eq(enrollments.studentId, childId),
+                    requestedYearId === null ? undefined : eq(classes.academicYearId, requestedYearId),
+                ));
             const grades = await db
                 .select({ classId: classGrades.classId, finalGrade: classGrades.finalGrade, letterGrade: classGrades.letterGrade })
-                .from(classGrades).where(eq(classGrades.studentId, childId));
+                .from(classGrades)
+                .innerJoin(classes, eq(classGrades.classId, classes.id))
+                .where(and(
+                    eq(classGrades.studentId, childId),
+                    requestedYearId === null ? undefined : eq(classes.academicYearId, requestedYearId),
+                ));
             const attendanceRows = await db.select({ status: attendance.status })
-                .from(attendance).where(eq(attendance.studentId, childId));
+                .from(attendance).where(and(
+                    eq(attendance.studentId, childId),
+                    selectedYear ? gte(attendance.date, selectedYear.startsOn) : undefined,
+                    selectedYear ? lte(attendance.date, selectedYear.endsOn) : undefined,
+                ));
             const total = attendanceRows.length;
             const present = attendanceRows.filter((r) => r.status === "present").length;
             return {

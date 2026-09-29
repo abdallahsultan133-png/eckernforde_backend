@@ -1,5 +1,4 @@
-import AgentAPI from "apminsight";
-AgentAPI.config()
+
 import express from 'express';
 import cors from "cors";
 import helmet from "helmet";
@@ -69,7 +68,7 @@ app.use('/api/users', usersRouter)
 app.use('/api/classes', classesRouter)
 app.use('/api/dashboard', dashboardRouter)
 app.use('/api/attendance', attendanceRouter)
-app.use('/api/assignments', assignmentsRouter)
+app.use('/api/homework', assignmentsRouter)
 app.use('/api/announcements', announcementsRouter)
 app.use('/api/grades', gradesRouter)
 app.use('/api/calendar', calendarRouter)
