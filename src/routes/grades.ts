@@ -497,7 +497,9 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             db
                 .select({
                     studentId: submissions.studentId,
-                    avg: avg(sql<number>`(${submissions.score}::float / NULLIF(${assignments.maxScore}, 0)) * 100`),
+                    // Weight the average by marks available across all graded
+                    // homework: total marks earned / total marks available.
+                    avg: sql<number>`(SUM(${submissions.score})::float / NULLIF(SUM(${assignments.maxScore}), 0)) * 100`,
                 })
                 .from(submissions)
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
@@ -570,15 +572,8 @@ router.get("/gradebook/:classId", requireAuth, async (req, res) => {
             const saved = gMap[s.studentId];
             const missingAssignmentSubmission = hasAssignments && !submittedMap[s.studentId];
 
-            // Weighted: 40% assignments, 60% exams (if both exist); otherwise whichever is available
-            let computed: number | null = null;
-            if (assignmentAvg !== null && examAvg !== null) {
-                computed = Math.round(assignmentAvg * 0.4 + examAvg * 0.6);
-            } else if (assignmentAvg !== null) {
-                computed = assignmentAvg;
-            } else if (examAvg !== null) {
-                computed = examAvg;
-            }
+            // Exams are reported separately and never change the homework result.
+            const computed = assignmentAvg;
 
             // A saved C/D grade must never make missing assignment work appear
             // passed. Keep the stored grade intact for audit purposes, but show

@@ -2,7 +2,7 @@ import express from "express";
 import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
-import { attendance, classes, enrollments, qrSessions } from "../db/schema/app.js";
+import { attendance, classes, enrollments, qrSessions, subjects } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
@@ -200,12 +200,14 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
                 id: attendance.id,
                 classId: attendance.classId,
                 className: classes.name,
+                subjectName: subjects.name,
                 date: attendance.date,
                 status: attendance.status,
                 notes: attendance.notes,
             })
             .from(attendance)
             .innerJoin(classes, eq(attendance.classId, classes.id))
+            .leftJoin(subjects, eq(classes.subjectId, subjects.id))
             .where(and(...conditions))
             .orderBy(desc(attendance.date))
             .limit(limit);

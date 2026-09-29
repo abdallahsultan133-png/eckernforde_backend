@@ -105,7 +105,7 @@ router.get("/public", async (req, res) => {
 // occurrences) + auto-generated ones from exams/assignments
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { from, to, classId } = req.query as { from?: string; to?: string; classId?: string };
+        const { from, to, classId, childId } = req.query as { from?: string; to?: string; classId?: string; childId?: string };
 
         const rangeStart = from && DATE_RE.test(from) ? new Date(from) : null;
         const rangeEnd = to && DATE_RE.test(to) ? new Date(to + "T23:59:59") : null;
@@ -146,8 +146,12 @@ router.get("/", requireAuth, async (req, res) => {
                 allowedIds = (await db.select({ id: classes.id }).from(classes)
                     .where(eq(classes.teacherId, req.user!.id!))).map(row => row.id);
             } else {
-                const studentIds = policy.isStudent(req.user!) ? [req.user!.id!]
+                let studentIds = policy.isStudent(req.user!) ? [req.user!.id!]
                     : policy.isParent(req.user!) ? await policy.getLinkedChildIds({ id: req.user!.id!, email: req.user!.email }) : [];
+                if (policy.isParent(req.user!) && childId) {
+                    if (!studentIds.includes(childId)) return policy.forbidden(res, "You can only view calendar entries for your linked children.");
+                    studentIds = [childId];
+                }
                 if (studentIds.length) {
                     allowedIds = (await db.select({ id: enrollments.classId }).from(enrollments)
                         .where(inArray(enrollments.studentId, studentIds))).map(row => row.id);
@@ -203,7 +207,7 @@ router.get("/", requireAuth, async (req, res) => {
                 classId: e.classId,
                 class: e.className ? { id: e.classId, name: e.className } : null,
                 source: "exam" as const,
-                description: null, link: null, createdBy: null, creator: null,
+                description: null, link: "/grades/exams", createdBy: null, creator: null,
                 createdAt: null, updatedAt: null,
                 isRecurrenceInstance: false, recurrenceParentId: null,
             })),
@@ -216,8 +220,8 @@ router.get("/", requireAuth, async (req, res) => {
                 allDay: false,
                 classId: d.classId,
                 class: d.className ? { id: d.classId, name: d.className } : null,
-                source: "assignment" as const,
-                description: null, link: null, createdBy: null, creator: null,
+                source: "homework" as const,
+                description: null, link: `/homework/${d.id}`, createdBy: null, creator: null,
                 createdAt: null, updatedAt: null,
                 isRecurrenceInstance: false, recurrenceParentId: null,
             })),

@@ -17,7 +17,7 @@ import { activePortalClassIds, isInActivePortalClass } from "../lib/portal-conte
 
 const router = express.Router();
 
-// GET /api/assignments?classId=&page=&limit=
+// GET /api/homework?classId=&page=&limit=
 // Lists assignments, optionally scoped to a class, newest first.
 router.get("/", requireAuth, async (req, res) => {
     try {
@@ -55,7 +55,7 @@ router.get("/", requireAuth, async (req, res) => {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
             const requestedChildId = typeof childId === "string" && childId.trim() ? childId.trim() : null;
             if (requestedChildId && !childIds.includes(requestedChildId)) {
-                return policy.forbidden(res, "You can only view assignments for your linked children.");
+                return policy.forbidden(res, "You can only view homework for your linked children.");
             }
             const scopedChildIds = requestedChildId ? [requestedChildId] : childIds;
             const childClassIds = scopedChildIds.length > 0
@@ -76,7 +76,7 @@ router.get("/", requireAuth, async (req, res) => {
         }
 
         // A student only sees assignments for classes they're actually enrolled
-        // in — not every class in the school. Without this, GET /api/assignments
+        // in — not every class in the school. Without this, GET /api/homework
         // (or ?classId= for a class they're not in) leaks other classes' work.
         if (policy.isStudent(req.user!)) {
             const enrolledClassIds = (await db
@@ -147,17 +147,17 @@ router.get("/", requireAuth, async (req, res) => {
 
         res.status(200).json({ data });
     } catch (e) {
-        console.error("GET /assignments error:", e);
-        res.status(500).json({ error: "Failed to load assignments" });
+        console.error("GET /homework error:", e);
+        res.status(500).json({ error: "Failed to load homework" });
     }
 });
 
-// GET /api/assignments/:id/report — teacher/admin only. Returns the marks
+// GET /api/homework/:id/report — teacher/admin only. Returns the marks
 // matrix for every assignment in the selected class subject.
 router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
-        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid homework id" });
 
         const [selectedAssignment] = await db
             .select({
@@ -172,13 +172,13 @@ router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, 
             .innerJoin(subjects, eq(classes.subjectId, subjects.id))
             .where(eq(assignments.id, id));
 
-        if (!selectedAssignment) return res.status(404).json({ error: "Assignment not found" });
+        if (!selectedAssignment) return res.status(404).json({ error: "Homework not found" });
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, selectedAssignment.classId))) {
             return policy.forbidden(res, "You can only view reports for classes you teach.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, selectedAssignment.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         const reportAssignments = await db
@@ -244,17 +244,17 @@ router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, 
             },
         });
     } catch (e) {
-        console.error("GET /assignments/:id/report error:", e);
-        res.status(500).json({ error: "Failed to load assignment report" });
+        console.error("GET /homework/:id/report error:", e);
+        res.status(500).json({ error: "Failed to load homework report" });
     }
 });
 
-// GET /api/assignments/:id
+// GET /api/homework/:id
 // Assignment detail. If the caller is a student, also returns their own submission (if any).
 router.get("/:id", requireAuth, async (req, res) => {
     try {
         const id = Number(req.params.id);
-        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid homework id" });
 
         const [assignment] = await db
             .select({
@@ -267,10 +267,10 @@ router.get("/:id", requireAuth, async (req, res) => {
             .innerJoin(user, eq(assignments.createdBy, user.id))
             .where(eq(assignments.id, id));
 
-        if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+        if (!assignment) return res.status(404).json({ error: "Homework not found" });
 
         if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, assignment.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         if (policy.isParent(req.user!)) {
@@ -291,12 +291,12 @@ router.get("/:id", requireAuth, async (req, res) => {
 
         res.status(200).json({ data: { ...assignment, mySubmission } });
     } catch (e) {
-        console.error("GET /assignments/:id error:", e);
-        res.status(500).json({ error: "Failed to load assignment" });
+        console.error("GET /homework/:id error:", e);
+        res.status(500).json({ error: "Failed to load homework" });
     }
 });
 
-// POST /api/assignments — teacher/admin only
+// POST /api/homework — teacher/admin only
 router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAssignmentSchema), async (req, res) => {
     try {
         const { classId, title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
@@ -311,7 +311,7 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
         };
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only create assignments for classes you teach.");
+            return policy.forbidden(res, "You can only create homework for classes you teach.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
             return policy.forbidden(res, "This class is outside your selected portal context.");
@@ -332,16 +332,16 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
             })
             .returning();
 
-        await logAction({ req, action: "assignment.create", resource: "assignments", resourceId: created?.id, details: `Created assignment "${title.trim()}"` });
+        await logAction({ req, action: "assignment.create", resource: "assignments", resourceId: created?.id, details: `Created homework "${title.trim()}"` });
 
         // Notify enrolled students about the new assignment
         if (created) {
             await notifyEnrolledStudents({
                 classId,
                 type: "assignment",
-                title: "New Assignment",
+                title: "New Homework",
                 message: `"${title.trim()}" has been posted.${dueAt ? ` Due: ${new Date(dueAt).toLocaleDateString()}` : ""}`,
-                link: `/assignments/${created.id}`,
+                link: `/homework/${created.id}`,
             });
 
             // Send email to enrolled students
@@ -356,31 +356,31 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
                     assignmentTitle: title.trim(),
                     className: cls?.name ?? "Your class",
                     dueAt: dueAt ? new Date(dueAt) : null,
-                    assignmentUrl: `${process.env.FRONTEND_URL}/assignments/${created.id}`,
+                    assignmentUrl: `${process.env.FRONTEND_URL}/homework/${created.id}`,
                 }); // fire-and-forget
             }
         }
 
         res.status(201).json({ data: created });
     } catch (e) {
-        console.error("POST /assignments error:", e);
-        res.status(500).json({ error: "Failed to create assignment" });
+        console.error("POST /homework error:", e);
+        res.status(500).json({ error: "Failed to create homework" });
     }
 });
 
-// PUT /api/assignments/:id — teacher/admin only
+// PUT /api/homework/:id — teacher/admin only
 router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(updateAssignmentSchema), async (req, res) => {
     try {
         const id = Number(req.params.id);
-        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid homework id" });
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
-        if (!existing) return res.status(404).json({ error: "Assignment not found" });
+        if (!existing) return res.status(404).json({ error: "Homework not found" });
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
-            return policy.forbidden(res, "You can only edit assignments for classes you teach.");
+            return policy.forbidden(res, "You can only edit homework for classes you teach.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         const { title, description, dueAt, maxScore, attachmentUrl, attachmentCldPubId, attachmentName } = req.body as {
@@ -407,49 +407,49 @@ router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(update
             .where(eq(assignments.id, id))
             .returning();
 
-        if (!updated) return res.status(404).json({ error: "Assignment not found" });
+        if (!updated) return res.status(404).json({ error: "Homework not found" });
 
         await logAction({ req, action: "assignment.update", resource: "assignments", resourceId: id });
 
         res.status(200).json({ data: updated });
     } catch (e) {
-        console.error("PUT /assignments/:id error:", e);
-        res.status(500).json({ error: "Failed to update assignment" });
+        console.error("PUT /homework/:id error:", e);
+        res.status(500).json({ error: "Failed to update homework" });
     }
 });
 
-// DELETE /api/assignments/:id — teacher/admin only
+// DELETE /api/homework/:id — teacher/admin only
 router.delete("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const id = Number(req.params.id);
-        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(id)) return res.status(400).json({ error: "Invalid homework id" });
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
-        if (!existing) return res.status(404).json({ error: "Assignment not found" });
+        if (!existing) return res.status(404).json({ error: "Homework not found" });
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
-            return policy.forbidden(res, "You can only delete assignments for classes you teach.");
+            return policy.forbidden(res, "You can only delete homework for classes you teach.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         const [deleted] = await db.delete(assignments).where(eq(assignments.id, id)).returning({ id: assignments.id });
-        if (!deleted) return res.status(404).json({ error: "Assignment not found" });
+        if (!deleted) return res.status(404).json({ error: "Homework not found" });
 
         await logAction({ req, action: "assignment.delete", resource: "assignments", resourceId: id });
 
         res.status(200).json({ data: deleted });
     } catch (e) {
-        console.error("DELETE /assignments/:id error:", e);
-        res.status(500).json({ error: "Failed to delete assignment" });
+        console.error("DELETE /homework/:id error:", e);
+        res.status(500).json({ error: "Failed to delete homework" });
     }
 });
 
-// POST /api/assignments/:id/submit — student only. Upserts the caller's own submission.
+// POST /api/homework/:id/submit — student only. Upserts the caller's own submission.
 router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(submitAssignmentSchema), async (req, res) => {
     try {
         const assignmentId = Number(req.params.id);
-        if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid homework id" });
 
         const { content, fileUrl, fileCldPubId, fileName } = req.body as {
             content?: string | null;
@@ -459,19 +459,19 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
         };
 
         const [assignment] = await db.select().from(assignments).where(eq(assignments.id, assignmentId));
-        if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+        if (!assignment) return res.status(404).json({ error: "Homework not found" });
 
         if (!(await policy.isEnrolledInClass(req.user!.id!, assignment.classId))) {
             return policy.forbidden(res, "You are not enrolled in this class.");
         }
         if (!(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, assignment.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         // Once the deadline passes, submission is closed entirely — no more
         // late submissions accepted.
         if (assignment.dueAt && new Date() > assignment.dueAt) {
-            return res.status(403).json({ error: "The deadline for this assignment has passed. You can no longer submit." });
+            return res.status(403).json({ error: "The deadline for this homework has passed. You can no longer submit." });
         }
 
         const studentId = req.user!.id!;
@@ -483,7 +483,7 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
             .from(submissions)
             .where(and(eq(submissions.assignmentId, assignmentId), eq(submissions.studentId, studentId)));
         if (existingSubmission) {
-            return res.status(409).json({ error: "You've already submitted this assignment. Resubmitting isn't allowed." });
+            return res.status(409).json({ error: "You've already submitted this homework. Resubmitting isn't allowed." });
         }
 
         const [result] = await db
@@ -506,24 +506,24 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
 
         res.status(200).json({ data: result });
     } catch (e) {
-        console.error("POST /assignments/:id/submit error:", e);
-        res.status(500).json({ error: "Failed to submit assignment" });
+        console.error("POST /homework/:id/submit error:", e);
+        res.status(500).json({ error: "Failed to submit homework" });
     }
 });
 
-// GET /api/assignments/:id/submissions — teacher/admin only. All submissions for grading.
+// GET /api/homework/:id/submissions — teacher/admin only. All submissions for grading.
 router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (req, res) => {
     try {
         const assignmentId = Number(req.params.id);
-        if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid assignment id" });
+        if (!Number.isFinite(assignmentId)) return res.status(400).json({ error: "Invalid homework id" });
 
         const [assignment] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, assignmentId));
-        if (!assignment) return res.status(404).json({ error: "Assignment not found" });
+        if (!assignment) return res.status(404).json({ error: "Homework not found" });
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, assignment.classId))) {
             return policy.forbidden(res, "You can only view submissions for classes you teach.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, assignment.classId))) {
-            return policy.forbidden(res, "This assignment is outside your selected portal context.");
+            return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
 
         const rows = await db
@@ -538,12 +538,12 @@ router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (
 
         res.status(200).json({ data: rows });
     } catch (e) {
-        console.error("GET /assignments/:id/submissions error:", e);
+        console.error("GET /homework/:id/submissions error:", e);
         res.status(500).json({ error: "Failed to load submissions" });
     }
 });
 
-// PUT /api/assignments/submissions/:submissionId/grade — teacher/admin only
+// PUT /api/homework/submissions/:submissionId/grade — teacher/admin only
 router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF_ROLES), validateBody(gradeSubmissionSchema), async (req, res) => {
     try {
         const submissionId = Number(req.params.submissionId);
@@ -560,7 +560,7 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
                 return policy.forbidden(res, "You can only grade submissions for classes you teach.");
             }
             if (!(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existingSubmission.classId))) {
-                return policy.forbidden(res, "This assignment is outside your selected portal context.");
+                return policy.forbidden(res, "This homework is outside your selected portal context.");
             }
         }
 
@@ -586,9 +586,9 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
         await notifyStudent({
             userId: updated.studentId,
             type: "grade",
-            title: "Assignment Graded",
+            title: "Homework Graded",
             message: `Your submission has been graded. Score: ${score}.${feedback ? ` Feedback: ${feedback}` : ""}`,
-            link: `/assignments/${updated.assignmentId}`,
+            link: `/homework/${updated.assignmentId}`,
         });
 
         // Send grade email to student
@@ -605,13 +605,13 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
                 score: Number(score),
                 maxScore: assignment.maxScore,
                 ...(feedbackStr ? { feedback: feedbackStr } : {}),
-                assignmentUrl: `${process.env.FRONTEND_URL}/assignments/${updated.assignmentId}`,
+                assignmentUrl: `${process.env.FRONTEND_URL}/homework/${updated.assignmentId}`,
             }); // fire-and-forget
         }
 
         res.status(200).json({ data: updated });
     } catch (e) {
-        console.error("PUT /assignments/submissions/:submissionId/grade error:", e);
+        console.error("PUT /homework/submissions/:submissionId/grade error:", e);
         res.status(500).json({ error: "Failed to grade submission" });
     }
 });

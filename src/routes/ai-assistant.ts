@@ -155,7 +155,7 @@ const getStudentProfileTool = betaZodTool({
     name: "get_student_full_profile",
     description:
         "Fetch one student's complete record: profile fields, enrolled classes, per-class grades, an attendance " +
-        "summary plus the 10 most recent attendance entries, the 15 most recent assignment/exam submissions, and " +
+        "summary plus the 10 most recent attendance entries, the 15 most recent homework/exam submissions, and " +
         "uploaded documents. Requires the exact studentId — call search_students first if you only have a name.",
     inputSchema: z.object({
         studentId: z.string().describe("The exact student user ID, e.g. from a prior search_students call."),
@@ -167,7 +167,7 @@ const SYSTEM_PROMPT = `You are the AI Student Assistant inside the school platfo
 
 Guidelines:
 - When the user names a student rather than giving an exact ID, call search_students first to resolve who they mean. If more than one student matches, list the candidates (name, email, registration number) and ask which one — never guess.
-- Once you have the exact studentId, call get_student_full_profile before answering questions about that student's grades, attendance, assignments, or documents.
+- Once you have the exact studentId, call get_student_full_profile before answering questions about that student's grades, attendance, homework, or documents.
 - Answer only from the data the tools return. Never invent a grade, attendance record, or other detail.
 - If a tool finds nothing, say so plainly rather than speculating.
 - The person chatting with you is already authorized staff — you do not need to ask permission before sharing a student's data with them.

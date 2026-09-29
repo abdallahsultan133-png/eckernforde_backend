@@ -575,6 +575,16 @@ describe("calendar read scope", () => {
         const clauses = dbState.predicates.map(p => new PgDialect().sqlToQuery(p).sql);
         expect(clauses.filter(sql => sql.includes("false"))).toHaveLength(3);
     });
+    it("lets a parent scope the calendar to one linked child", async () => {
+        queueDb([{ userId: "child-1" }], [{ id: 77 }], [], [], []);
+        expect((await call("GET", "/api/calendar?childId=child-1", { as: USERS.parent })).status).toBe(200);
+        const clauses = dbState.predicates.map(p => new PgDialect().sqlToQuery(p));
+        expect(clauses.filter(p => p.params.includes(77))).toHaveLength(3);
+    });
+    it("rejects a calendar request for somebody else's child", async () => {
+        queueDb([{ userId: "child-1" }]);
+        expect((await call("GET", "/api/calendar?childId=child-2", { as: USERS.parent })).status).toBe(403);
+    });
 });
 
 describe("calendar events — add / remove is admin only", () => {
