@@ -24,7 +24,8 @@ const securityMiddleware = async (req: Request, res: Response, next: NextFunctio
         let message: string;
 
         switch (role) {
-            case 'admin':
+            case 'primary_headmaster':
+            case 'secondary_headmaster':
             case 'super_admin':
                 client = CLIENTS.admin;
                 message ='Admin request limit exceeded (100 per minute). Slow down.';

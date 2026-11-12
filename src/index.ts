@@ -23,6 +23,7 @@ import admissionsRouter from "./routes/admissions.js";
 import portalContextRouter from "./routes/portal-context.js";
 import reportCardTemplateRouter from "./routes/report-card-template.js";
 import systemRouter from "./routes/system.js";
+import passwordResetRequestsRouter from "./routes/password-reset-requests.js";
 import securityMiddleware from "./middleware/security.js";
 import {resolveSession} from "./middleware/resolve-session.js";
 import {toNodeHandler} from "better-auth/node";
@@ -61,6 +62,9 @@ app.use(securityMiddleware);
 app.all("/api/auth/*splat", toNodeHandler(auth));
 
 app.use(express.json());
+// Password recovery must remain available even when normal portal access is
+// disabled, so mount it before requireSystemEnabled.
+app.use('/api/password-reset-requests', passwordResetRequestsRouter);
 app.use(requireSystemEnabled);
 
 app.use('/api/subjects', subjectsRouter)

@@ -9,9 +9,17 @@ import { validateBody } from "../middleware/validate.js";
 import { createClassSchema, updateClassSchema, enrollSchema, joinClassSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
-import { activePortalClassIds, currentAcademicYear } from "../lib/portal-context.js";
+import { activePortalClassIds, bandForStage, currentAcademicYear, isInActivePortalClass, stageForClass } from "../lib/portal-context.js";
 
 const router = express.Router();
+
+const inferredSchoolBand = (name: string) => {
+    const stage = stageForClass(name);
+    return stage ? bandForStage(stage) : null;
+};
+
+const matchesClassName = (level: "nursery" | "primary" | "secondary", inferred: "primary" | "secondary" | null) =>
+    !inferred || level === inferred || (level === "nursery" && inferred === "primary");
 
 // GET /api/classes/enrolled-ids — the caller's own enrolled class ids, used by
 // the class catalog to show "Join" vs "Enrolled" per row without an extra
@@ -35,8 +43,9 @@ router.post('/join', requireAuth, requireRole("student"), validateBody(joinClass
         const { inviteCode } = req.body as { inviteCode: string };
 
         const [foundClass] = await db
-            .select({ id: classes.id, name: classes.name, status: classes.status })
+            .select({ id: classes.id, name: classes.name, status: classes.status, subjectName: subjects.name })
             .from(classes)
+            .leftJoin(subjects, eq(classes.subjectId, subjects.id))
             .where(eq(classes.inviteCode, inviteCode));
         if (!foundClass) return res.status(404).json({ error: "Invalid invite code. Double-check it and try again." });
         if (foundClass.status !== "active") return res.status(400).json({ error: "This class isn't currently accepting students." });
@@ -51,7 +60,7 @@ router.post('/join', requireAuth, requireRole("student"), validateBody(joinClass
         await db.insert(enrollments).values({ classId: foundClass.id, studentId });
         await logAction({ req, action: "class.self_join", resource: "enrollments", resourceId: foundClass.id, details: `Joined via invite code` });
 
-        res.status(201).json({ data: { id: foundClass.id, name: foundClass.name } });
+        res.status(201).json({ data: { id: foundClass.id, name: foundClass.name, subjectName: foundClass.subjectName } });
     } catch (e) {
         console.error("POST /classes/join error:", e);
         res.status(500).json({ error: "Failed to join class" });
@@ -61,7 +70,7 @@ router.post('/join', requireAuth, requireRole("student"), validateBody(joinClass
 // Get all classes with optional search, filtering and pagination
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { search, subject, teacher, mine, page = 1, limit = 10 } = req.query;
+        const { search, subject, teacher, schoolLevel, academicYearId, stage, mine, page = 1, limit = 10 } = req.query;
 
         const currentPage = Math.max(1, parseInt(String(page), 10) || 1);
         const limitPerPage = Math.min(Math.max(1, parseInt(String(limit), 10) || 10), 100); // Max 100 records per page
@@ -92,6 +101,37 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(user.name, teacherPattern));
         }
 
+        if (schoolLevel !== undefined) {
+            const level = String(schoolLevel);
+            if (!['primary', 'secondary'].includes(level)) return res.status(400).json({ error: 'Invalid school level' });
+            const levelCondition = eq(classes.schoolLevel, level as 'primary' | 'secondary');
+            // A chosen school level is an exact scope, including for super admins.
+            filterConditions.push(levelCondition);
+        }
+
+        if (academicYearId !== undefined) {
+            const yearId = Number(academicYearId);
+            if (!Number.isInteger(yearId) || yearId <= 0) return res.status(400).json({ error: 'Invalid academic year' });
+            filterConditions.push(eq(classes.academicYearId, yearId));
+        }
+
+        if (stage !== undefined) {
+            const selectedStage = String(stage).trim().toLowerCase();
+            const stageParts = selectedStage.split("_");
+            const roman = stageParts.at(-1);
+            const patterns = selectedStage === "nursery"
+                ? ["nursery%"]
+                : selectedStage.startsWith("kindergarten_") && roman
+                    ? [`kg ${roman}%`, `kg_${roman}%`, `kindergarten ${roman}%`, `kindergarten_${roman}%`]
+                    : selectedStage.startsWith("standard_") && roman
+                        ? [`standard ${roman}%`, `standard_${roman}%`, `class ${roman}%`, `class_${roman}%`]
+                        : selectedStage.startsWith("form_") && roman
+                            ? [`form ${roman}%`, `form_${roman}%`]
+                            : [];
+            if (patterns.length === 0) return res.status(400).json({ error: "Invalid class stage" });
+            filterConditions.push(or(...patterns.map((pattern) => ilike(classes.name, pattern)))!);
+        }
+
         // Row-level list scoping (policy): a teacher only sees the classes they
         // teach; admins, parents, students see the full catalogue.
         const scope = policy.teacherClassScope(req.user!);
@@ -104,7 +144,7 @@ router.get("/", requireAuth, async (req, res) => {
         const caller = req.user!;
         if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
             const selectedClassIds = await activePortalClassIds({ ...caller, id: caller.id });
-            if (selectedClassIds) {
+            if (selectedClassIds !== null) {
                 if (selectedClassIds.length === 0) return res.json({ data: [], pagination: { page: currentPage, limit: limitPerPage, total: 0, totalPages: 0 } });
                 filterConditions.push(inArray(classes.id, selectedClassIds));
             }
@@ -194,14 +234,17 @@ router.get('/:id', requireAuth, async (req, res) => {
 
     if(!classDetails) return res.status(404).json({ error: 'No Class found.' });
 
-    if (policy.isTeacher(req.user!)) {
+    if (policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) {
         const selected = await activePortalClassIds({ ...req.user!, id: req.user!.id! });
-        if (!(await policy.canManageClass(req.user!, classId)) || (selected !== null && !selected.includes(classId))) {
+        if (!(await policy.canManageClass(req.user!, classId)) || (policy.isTeacher(req.user!) && selected !== null && !selected.includes(classId))) {
             return policy.forbidden(res, "You can only view classes in your selected teaching context.");
         }
     } else if (policy.isStudent(req.user!)) {
-        if (!(await policy.isEnrolledInClass(req.user!.id!, classId))) {
-            return policy.forbidden(res, "You are not enrolled in this class.");
+        // Students may open any active class from the catalogue before they
+        // join it, so they can inspect the teacher, subject, schedule, and
+        // available class workspace before deciding to enroll.
+        if (classDetails.status !== "active") {
+            return policy.forbidden(res, "This class is not currently available.");
         }
     }
 
@@ -221,11 +264,28 @@ router.post('/', requireAuth, requireRole(...STAFF_ROLES), validateBody(createCl
             academicYearId?: number | null;
         };
 
-        const activeYear = academicYearId === undefined ? await currentAcademicYear() : null;
+        const isTeacher = policy.isTeacher(req.user!);
+        const activeYear = isTeacher || academicYearId === undefined ? await currentAcademicYear() : null;
+        const headmasterLevel = policy.headmasterSchoolLevel(req.user!);
+        if (headmasterLevel && schoolLevel && schoolLevel !== headmasterLevel) {
+            return policy.forbidden(res, `A ${headmasterLevel} headmaster can only create ${headmasterLevel} classes.`);
+        }
+        const inferredSchoolLevel = inferredSchoolBand(name);
+        const resolvedSchoolLevel = headmasterLevel ?? (isTeacher ? inferredSchoolLevel : schoolLevel ?? inferredSchoolLevel);
+        if (!resolvedSchoolLevel) {
+            return res.status(400).json({ error: "Choose a school level or name the class with a recognized form or standard." });
+        }
+        if (!matchesClassName(resolvedSchoolLevel, inferredSchoolLevel)) {
+            return res.status(400).json({ error: "The selected school level does not match this class or form name." });
+        }
+        const resolvedAcademicYearId = isTeacher ? activeYear?.id : academicYearId ?? activeYear?.id;
+        if (!resolvedAcademicYearId) {
+            return res.status(409).json({ error: "Choose an academic year before creating this class." });
+        }
 
         const [createdClass] = await db
             .insert(classes)
-            .values({ name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, ...(policy.isAdmin(req.user!) ? { schoolLevel, academicYearId: academicYearId ?? activeYear?.id ?? null } : { academicYearId: activeYear?.id ?? null }), teacherId, inviteCode: Math.random().toString(36).substring(2, 9), schedules: [] })
+            .values({ name, subjectId, description, capacity, bannerUrl, bannerCldPubId, status, schoolLevel: resolvedSchoolLevel, academicYearId: resolvedAcademicYearId, teacherId, inviteCode: Math.random().toString(36).substring(2, 9), schedules: [] })
             .returning({ id: classes.id });
 
         if(!createdClass) throw Error;
@@ -246,7 +306,10 @@ router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(update
 
         const [existing] = await db.select().from(classes).where(eq(classes.id, classId));
         if (!existing) return res.status(404).json({ error: 'Class not found.' });
-        if (!policy.ownsOrAdmin(req.user!, existing.teacherId)) {
+        if (policy.isTeacher(req.user!) && existing.teacherId !== req.user!.id) {
+            return policy.forbidden(res, "You can only edit classes you teach.");
+        }
+        if (policy.isHeadmaster(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only edit classes you teach.");
         }
 
@@ -261,6 +324,20 @@ router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(update
         // Only an admin may reassign a class to a different teacher — a
         // teacher editing their own class can't hand it off to someone else.
         const isAdmin = policy.isAdmin(req.user!);
+        if (schoolLevel === null || academicYearId === null) {
+            return res.status(400).json({ error: "A class must retain its school level and academic year." });
+        }
+        const nextSchoolLevel = (isAdmin && schoolLevel !== undefined ? schoolLevel : existing.schoolLevel) ?? inferredSchoolBand(name ?? existing.name);
+        if (!nextSchoolLevel) {
+            return res.status(400).json({ error: "Choose a school level before editing this class." });
+        }
+        if (!matchesClassName(nextSchoolLevel, inferredSchoolBand(name ?? existing.name))) {
+            return res.status(400).json({ error: "The selected school level does not match this class or form name." });
+        }
+        const nextAcademicYearId = isAdmin && academicYearId !== undefined ? academicYearId : existing.academicYearId;
+        if (!nextAcademicYearId) {
+            return res.status(409).json({ error: "Assign an academic year to this class before editing it." });
+        }
 
         const [updated] = await db
             .update(classes)
@@ -273,8 +350,8 @@ router.put('/:id', requireAuth, requireRole(...STAFF_ROLES), validateBody(update
                 ...(bannerUrl !== undefined ? { bannerUrl } : {}),
                 ...(bannerCldPubId !== undefined ? { bannerCldPubId } : {}),
                 ...(status !== undefined ? { status } : {}),
-                ...(schoolLevel !== undefined && isAdmin ? { schoolLevel } : {}),
-                ...(academicYearId !== undefined && isAdmin ? { academicYearId } : {}),
+                schoolLevel: nextSchoolLevel,
+                academicYearId: nextAcademicYearId,
             })
             .where(eq(classes.id, classId))
             .returning();
@@ -293,6 +370,7 @@ router.delete('/:id', requireAuth, requireRole(...ADMIN_ROLES), async (req, res)
         const classId = Number(req.params.id);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: 'Invalid class id' });
 
+        if (!(await policy.canManageClass(req.user!, classId))) return policy.forbidden(res, "You can only delete classes in your school.");
         const [deleted] = await db.delete(classes).where(eq(classes.id, classId)).returning({ id: classes.id });
         if (!deleted) return res.status(404).json({ error: 'Class not found.' });
 
@@ -319,13 +397,16 @@ router.get('/:id/students', requireAuth, async (req, res) => {
 
         // Roster visibility (policy): teacher-of-class, enrolled student,
         // linked parent with a child in the class, or any admin.
-        if (policy.isTeacher(caller)) {
+        if (policy.isTeacher(caller) || policy.isHeadmaster(caller)) {
             if (!(await policy.canManageClass(caller, classId))) {
-                return policy.forbidden(res, "You can only view rosters for classes you teach.");
+                return policy.forbidden(res, "You can only view rosters for classes in your school.");
+            }
+            if (policy.isTeacher(caller) && !(await isInActivePortalClass({ ...caller, id: caller.id! }, classId))) {
+                return policy.forbidden(res, "This class is outside your selected portal context.");
             }
         } else if (policy.isStudent(caller)) {
             if (!(await policy.isEnrolledInClass(caller.id!, classId))) {
-                return policy.forbidden(res, "You're not enrolled in this class.");
+                return policy.forbidden(res, "You can only view the roster of a class you are enrolled in.");
             }
         } else if (policy.isParent(caller)) {
             const childIds = await policy.getLinkedChildIds({ id: caller.id!, email: caller.email });
@@ -340,7 +421,7 @@ router.get('/:id/students', requireAuth, async (req, res) => {
             .select({ id: user.id, name: user.name, email: user.email, image: user.image })
             .from(enrollments)
             .innerJoin(user, eq(enrollments.studentId, user.id))
-            .where(eq(enrollments.classId, classId))
+            .where(and(eq(enrollments.classId, classId), policy.isTeacher(caller) ? eq(user.role, "student") : undefined))
             .orderBy(user.name);
         res.json({ data: roster });
     } catch (e) {
@@ -354,8 +435,11 @@ router.post('/:id/enroll', requireAuth, requireRole(...STAFF_ROLES), validateBod
     try {
         const classId = Number(req.params.id);
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only enroll students into classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only enroll students into classes in your school.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const { studentId, email } = req.body as { studentId?: string; email?: string };
@@ -399,6 +483,9 @@ router.delete('/:id/enroll/:studentId', requireAuth, requireRole(...STAFF_ROLES)
 
         if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
             return policy.forbidden(res, "You can only remove students from classes you teach.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const studentId = String(req.params.studentId ?? "");

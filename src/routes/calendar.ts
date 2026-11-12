@@ -14,6 +14,12 @@ const router = express.Router();
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}/;
 
+function readAcademicYearId(value: unknown): number | null | undefined {
+    if (value === undefined) return undefined;
+    const id = Number(value);
+    return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 // Recurrence is expanded at read time, not persisted per-occurrence — see the
 // comment on calendarRecurrenceFreqEnum in db/schema/app.ts. Synthetic
 // occurrence ids live in a namespace far above real (serial) ids so they can
@@ -105,13 +111,17 @@ router.get("/public", async (req, res) => {
 // occurrences) + auto-generated ones from exams/assignments
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { from, to, classId, childId } = req.query as { from?: string; to?: string; classId?: string; childId?: string };
+        const { from, to, classId, childId, academicYearId: rawAcademicYearId } = req.query as { from?: string; to?: string; classId?: string; childId?: string; academicYearId?: string };
+        const academicYearId = readAcademicYearId(rawAcademicYearId);
+        if (academicYearId === null) return res.status(400).json({ error: "Invalid academic year" });
+        const dashboardClassScope = academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId);
 
         const rangeStart = from && DATE_RE.test(from) ? new Date(from) : null;
         const rangeEnd = to && DATE_RE.test(to) ? new Date(to + "T23:59:59") : null;
 
         const conditions = [];
         if (classId) conditions.push(eq(calendarEvents.classId, Number(classId)));
+        if (dashboardClassScope) conditions.push(or(isNull(calendarEvents.classId), dashboardClassScope)!);
         if (rangeEnd) conditions.push(lte(calendarEvents.startAt, rangeEnd));
         if (rangeStart) {
             // A row belongs in the fetch set if either its own startAt falls in
@@ -133,15 +143,18 @@ router.get("/", requireAuth, async (req, res) => {
         if (from && DATE_RE.test(from)) examConditions.push(gte(exams.scheduledAt, new Date(from)));
         if (to && DATE_RE.test(to)) examConditions.push(lte(exams.scheduledAt, new Date(to + "T23:59:59")));
         if (classId) examConditions.push(eq(exams.classId, Number(classId)));
+        if (dashboardClassScope) examConditions.push(dashboardClassScope);
 
         // Auto-include assignment deadlines in range
         const assignConditions = [];
         if (from && DATE_RE.test(from)) assignConditions.push(gte(assignments.dueAt, new Date(from)));
         if (to && DATE_RE.test(to)) assignConditions.push(lte(assignments.dueAt, new Date(to + "T23:59:59")));
         if (classId) assignConditions.push(eq(assignments.classId, Number(classId)));
+        if (dashboardClassScope) assignConditions.push(dashboardClassScope);
 
         if (!policy.isAdmin(req.user!)) {
             let allowedIds: number[] = [];
+            let contextScoped = false;
             if (policy.isTeacher(req.user!)) {
                 allowedIds = (await db.select({ id: classes.id }).from(classes)
                     .where(eq(classes.teacherId, req.user!.id!))).map(row => row.id);
@@ -157,14 +170,18 @@ router.get("/", requireAuth, async (req, res) => {
                         .where(inArray(enrollments.studentId, studentIds))).map(row => row.id);
                 }
             }
-            // Form/class events follow the active portal context. School-wide
-            // events (with no class) remain visible to everyone.
+            // A saved teacher/student portal context is a hard boundary. Once
+            // selected, even school-wide calendar items must not carry over
+            // from another class/form view.
             if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!))) {
                 const selectedClassIds = await activePortalClassIds({ ...req.user!, id: req.user!.id });
-                if (selectedClassIds) allowedIds = allowedIds.filter((id) => selectedClassIds.includes(id));
+                if (selectedClassIds !== null) {
+                    contextScoped = true;
+                    allowedIds = allowedIds.filter((id) => selectedClassIds.includes(id));
+                }
             }
-            conditions.push(or(isNull(calendarEvents.classId), allowedIds.length
-                ? inArray(calendarEvents.classId, allowedIds) : sql`false`)!);
+            const allowedClassCondition = allowedIds.length ? inArray(calendarEvents.classId, allowedIds) : sql`false`;
+            conditions.push(contextScoped ? allowedClassCondition : or(isNull(calendarEvents.classId), allowedClassCondition)!);
             examConditions.push(allowedIds.length ? inArray(exams.classId, allowedIds) : sql`false`);
             assignConditions.push(allowedIds.length ? inArray(assignments.classId, allowedIds) : sql`false`);
         }

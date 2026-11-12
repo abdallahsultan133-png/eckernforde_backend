@@ -1,7 +1,7 @@
-import { pgTable, text, timestamp, boolean, pgEnum, index } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, jsonb, pgEnum, index } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 
-export const roleEnum = pgEnum("role", ["student", "teacher", "admin", "parent", "super_admin"]);
+export const roleEnum = pgEnum("role", ["student", "teacher", "primary_headmaster", "secondary_headmaster", "parent", "super_admin"]);
 
 const timestamps = {
     createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -16,6 +16,7 @@ export const user = pgTable("user", {
     image: text("image"),
     role: roleEnum("role").default("student").notNull(),
     imageCldPubId: text("image_cld_pub_id"),
+    notificationPreferences: jsonb("notification_preferences").$type<{ inApp: boolean; email: boolean }>().notNull().default({ inApp: true, email: true }),
     ...timestamps
 }, (table) => [
     index("user_role_idx").on(table.role),

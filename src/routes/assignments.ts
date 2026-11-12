@@ -8,7 +8,8 @@ import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-aut
 import { validateBody } from "../middleware/validate.js";
 import { createAssignmentSchema, updateAssignmentSchema, submitAssignmentSchema, gradeSubmissionSchema } from "../lib/schemas.js";
 import { notifyEnrolledStudents, notifyStudent } from "./notifications.js";
-import { sendAssignmentEmail, sendGradeEmail } from "../lib/email.js";
+import { sendAssignmentEmail, sendGradeEmail, sendPortalAlertEmail } from "../lib/email.js";
+import { classNotificationRecipients, filterNotificationRecipients } from "../lib/user-notification-preferences.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
 import { getLinkedChildIds } from "../lib/policy.js";
@@ -21,7 +22,7 @@ const router = express.Router();
 // Lists assignments, optionally scoped to a class, newest first.
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { classId, subjectId, childId, academicYearId, page = 1, limit = 20, dueFrom, dueTo, sort } = req.query;
+        const { classId, subjectId, childId, academicYearId, schoolLevel: requestedSchoolLevel, stage: requestedStage, page = 1, limit = 20, dueFrom, dueTo, sort } = req.query;
 
         const currentPage = Math.max(1, parseInt(String(page), 10) || 1);
         const limitPerPage = Math.min(Math.max(1, parseInt(String(limit), 10) || 20), 100);
@@ -38,19 +39,41 @@ router.get("/", requireAuth, async (req, res) => {
         }
         if (classId) conditions.push(eq(assignments.classId, Number(classId)));
         if (subjectId) conditions.push(eq(classes.subjectId, Number(subjectId)));
+        if (req.user!.role === "super_admin" && requestedSchoolLevel !== undefined) {
+            const schoolLevel = String(requestedSchoolLevel);
+            if (!["primary", "secondary"].includes(schoolLevel)) return res.status(400).json({ error: "Invalid school level" });
+            conditions.push(eq(classes.schoolLevel, schoolLevel as "primary" | "secondary"));
+        }
+        if (req.user!.role === "super_admin" && requestedStage !== undefined) {
+            const selectedStage = String(requestedStage).trim().toLowerCase();
+            const parts = selectedStage.split("_");
+            const roman = parts.at(-1);
+            const patterns = selectedStage === "nursery" ? ["nursery%"]
+                : selectedStage.startsWith("kindergarten_") && roman ? [`kg ${roman}%`, `kg_${roman}%`, `kindergarten ${roman}%`, `kindergarten_${roman}%`]
+                : selectedStage.startsWith("standard_") && roman ? [`standard ${roman}%`, `standard_${roman}%`, `class ${roman}%`, `class_${roman}%`]
+                : selectedStage.startsWith("form_") && roman ? [`form ${roman}%`, `form_${roman}%`] : [];
+            if (!patterns.length) return res.status(400).json({ error: "Invalid class or form" });
+            conditions.push(sql`(${sql.join(patterns.map((pattern) => sql`${classes.name} ilike ${pattern}`), sql` or `)})`);
+        }
+        if (req.user!.role === "super_admin" && academicYearId !== undefined) {
+            const yearId = Number(academicYearId);
+            if (!Number.isInteger(yearId) || yearId <= 0) return res.status(400).json({ error: "Invalid academic year" });
+            conditions.push(eq(classes.academicYearId, yearId));
+        }
         // Row-level list scoping (policy): a teacher only sees assignments for
         // classes they teach; admins/super_admins see everything.
         const teacherScope = policy.teacherClassScope(req.user!);
         if (teacherScope) conditions.push(teacherScope);
 
         const caller = req.user!;
-        if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
+        if (policy.isTeacher(caller) && caller.id) {
             const selectedClassIds = await activePortalClassIds({ ...caller, id: caller.id });
             if (selectedClassIds) conditions.push(selectedClassIds.length ? inArray(assignments.classId, selectedClassIds) : sql`false`);
         }
 
         // A parent only sees assignments for classes their own linked
         // children are enrolled in — not every class in the school.
+        let parentStudentId: string | null = null;
         if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
             const requestedChildId = typeof childId === "string" && childId.trim() ? childId.trim() : null;
@@ -58,6 +81,7 @@ router.get("/", requireAuth, async (req, res) => {
                 return policy.forbidden(res, "You can only view homework for your linked children.");
             }
             const scopedChildIds = requestedChildId ? [requestedChildId] : childIds;
+            parentStudentId = requestedChildId;
             const childClassIds = scopedChildIds.length > 0
                 ? [...new Set((await db
                     .select({ classId: enrollments.classId })
@@ -121,7 +145,7 @@ router.get("/", requireAuth, async (req, res) => {
                     .where(inArray(submissions.assignmentId, assignmentIds))
                     .groupBy(submissions.assignmentId)
                 : Promise.resolve([]),
-            assignmentIds.length > 0 && policy.isStudent(req.user!)
+            assignmentIds.length > 0 && (policy.isStudent(req.user!) || parentStudentId)
                 ? db
                     .select({
                         assignmentId: submissions.assignmentId,
@@ -129,7 +153,7 @@ router.get("/", requireAuth, async (req, res) => {
                         score: submissions.score,
                     })
                     .from(submissions)
-                    .where(and(eq(submissions.studentId, req.user!.id!), inArray(submissions.assignmentId, assignmentIds)))
+                    .where(and(eq(submissions.studentId, parentStudentId ?? req.user!.id!), inArray(submissions.assignmentId, assignmentIds)))
                 : Promise.resolve([]),
         ]);
 
@@ -174,8 +198,8 @@ router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, 
 
         if (!selectedAssignment) return res.status(404).json({ error: "Homework not found" });
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, selectedAssignment.classId))) {
-            return policy.forbidden(res, "You can only view reports for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, selectedAssignment.classId))) {
+            return policy.forbidden(res, "You can only view reports for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, selectedAssignment.classId))) {
             return policy.forbidden(res, "This homework is outside your selected portal context.");
@@ -191,7 +215,7 @@ router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, 
             .select({ id: user.id, name: user.name, email: user.email })
             .from(enrollments)
             .innerJoin(user, eq(enrollments.studentId, user.id))
-            .where(eq(enrollments.classId, selectedAssignment.classId))
+            .where(and(eq(enrollments.classId, selectedAssignment.classId), policy.isTeacher(req.user!) ? eq(user.role, "student") : undefined))
             .orderBy(asc(user.name));
 
         const assignmentIds = reportAssignments.map((assignment) => assignment.id);
@@ -199,7 +223,10 @@ router.get("/:id/report", requireAuth, requireRole(...STAFF_ROLES), async (req, 
             ? await db
                 .select({ assignmentId: submissions.assignmentId, studentId: submissions.studentId, status: submissions.status, score: submissions.score })
                 .from(submissions)
-                .where(inArray(submissions.assignmentId, assignmentIds))
+                .where(and(
+                    inArray(submissions.assignmentId, assignmentIds),
+                    policy.isTeacher(req.user!) ? inArray(submissions.studentId, classStudents.map((student) => student.id)) : undefined,
+                ))
             : [];
         const submissionByKey = new Map(reportSubmissions.map((submission) => [`${submission.studentId}:${submission.assignmentId}`, submission]));
 
@@ -260,6 +287,7 @@ router.get("/:id", requireAuth, async (req, res) => {
             .select({
                 ...getTableColumns(assignments),
                 class: { id: classes.id, name: classes.name },
+                classAcademicYearId: classes.academicYearId,
                 creator: { id: user.id, name: user.name },
             })
             .from(assignments)
@@ -269,23 +297,34 @@ router.get("/:id", requireAuth, async (req, res) => {
 
         if (!assignment) return res.status(404).json({ error: "Homework not found" });
 
-        if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, assignment.classId))) {
+        if (policy.isHeadmaster(req.user!) && !(await policy.canManageClass(req.user!, assignment.classId))) {
+            return policy.forbidden(res, "This homework is outside your school.");
+        }
+        if (req.user!.id && policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, assignment.classId))) {
             return policy.forbidden(res, "This homework is outside your selected portal context.");
         }
+        if (policy.isStudent(req.user!) && !(await policy.isEnrolledInClass(req.user!.id!, assignment.classId))) {
+            return policy.forbidden(res, "You are not enrolled in this homework's class.");
+        }
 
+
+        let submissionStudentId: string | null = null;
         if (policy.isParent(req.user!)) {
             const childIds = await getLinkedChildIds({ id: req.user!.id!, email: req.user!.email });
-            if (!(await policy.anyChildEnrolledInClass(childIds, assignment.classId))) {
-                return policy.forbidden(res, "None of your children are enrolled in this class.");
-            }
+            const childId = typeof req.query.childId === "string" ? req.query.childId.trim() : "";
+            const yearId = Number(req.query.academicYearId);
+            if (!childId || !Number.isInteger(yearId) || yearId <= 0) return res.status(400).json({ error: "Select a child and academic year to view this homework." });
+            if (!childIds.includes(childId) || !(await policy.isEnrolledInClass(childId, assignment.classId))) return policy.forbidden(res, "This homework is not available for the selected child.");
+            if (assignment.classAcademicYearId !== yearId) return res.status(404).json({ error: "Homework not found in the selected academic year." });
+            submissionStudentId = childId;
         }
 
         let mySubmission = null;
-        if (req.user?.role === "student" && req.user.id) {
+        if ((req.user?.role === "student" && req.user.id) || submissionStudentId) {
             const [row] = await db
                 .select()
                 .from(submissions)
-                .where(and(eq(submissions.assignmentId, id), eq(submissions.studentId, req.user.id)));
+                .where(and(eq(submissions.assignmentId, id), eq(submissions.studentId, submissionStudentId ?? req.user!.id!)));
             mySubmission = row ?? null;
         }
 
@@ -310,8 +349,8 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
             attachmentName?: string | null;
         };
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only create homework for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only create homework for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
             return policy.forbidden(res, "This class is outside your selected portal context.");
@@ -345,10 +384,9 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAs
             });
 
             // Send email to enrolled students
-            const enrolled = await db.select({ email: user.email }).from(enrollments)
-                .innerJoin(user, eq(enrollments.studentId, user.id))
-                .where(eq(enrollments.classId, classId));
-            const emails = enrolled.map((e) => e.email).filter(Boolean) as string[];
+            const enrolled = await classNotificationRecipients(classId);
+            const emailEnabledIds = new Set(await filterNotificationRecipients(enrolled.map((recipient) => recipient.id), "email"));
+            const emails = enrolled.filter((recipient) => emailEnabledIds.has(recipient.id)).map((recipient) => recipient.email).filter(Boolean) as string[];
             if (emails.length > 0) {
                 const [cls] = await db.select({ name: classes.name }).from(classes).where(eq(classes.id, classId));
                 sendAssignmentEmail({
@@ -376,8 +414,8 @@ router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(update
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
         if (!existing) return res.status(404).json({ error: "Homework not found" });
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
-            return policy.forbidden(res, "You can only edit homework for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only edit homework for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
             return policy.forbidden(res, "This homework is outside your selected portal context.");
@@ -426,8 +464,8 @@ router.delete("/:id", requireAuth, requireRole(...STAFF_ROLES), async (req, res)
 
         const [existing] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, id));
         if (!existing) return res.status(404).json({ error: "Homework not found" });
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, existing.classId))) {
-            return policy.forbidden(res, "You can only delete homework for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only delete homework for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existing.classId))) {
             return policy.forbidden(res, "This homework is outside your selected portal context.");
@@ -504,6 +542,28 @@ router.post("/:id/submit", requireAuth, requireRole("student"), validateBody(sub
             void runAiDetection(result.id, content);
         }
 
+        const [classOwner] = await db.select({ teacherId: classes.teacherId, name: classes.name })
+            .from(classes).where(eq(classes.id, assignment.classId));
+        const teacherRecipients = [...new Set([assignment.createdBy, classOwner?.teacherId].filter((id): id is string => Boolean(id)))];
+        await Promise.all(teacherRecipients.map((userId) => notifyStudent({
+            userId,
+            type: "assignment",
+            title: "New homework submission",
+            message: `${req.user!.name} submitted "${assignment.title}"${classOwner?.name ? ` for ${classOwner.name}` : ""}.`,
+            link: `/homework/${assignmentId}`,
+        })));
+        const teacherAccounts = teacherRecipients.length
+            ? await db.select({ id: user.id, email: user.email }).from(user).where(inArray(user.id, teacherRecipients))
+            : [];
+        const emailEnabledTeacherIds = new Set(await filterNotificationRecipients(teacherRecipients, "email"));
+        const teacherEmails = teacherAccounts.filter((teacherAccount) => emailEnabledTeacherIds.has(teacherAccount.id)).map((teacherAccount) => teacherAccount.email);
+        await sendPortalAlertEmail({
+            to: teacherEmails,
+            title: "New homework submission",
+            message: `${req.user!.name} submitted "${assignment.title}"${classOwner?.name ? ` for ${classOwner.name}` : ""}.`,
+            link: `/homework/${assignmentId}`,
+        });
+
         res.status(200).json({ data: result });
     } catch (e) {
         console.error("POST /homework/:id/submit error:", e);
@@ -519,8 +579,8 @@ router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (
 
         const [assignment] = await db.select({ classId: assignments.classId }).from(assignments).where(eq(assignments.id, assignmentId));
         if (!assignment) return res.status(404).json({ error: "Homework not found" });
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, assignment.classId))) {
-            return policy.forbidden(res, "You can only view submissions for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, assignment.classId))) {
+            return policy.forbidden(res, "You can only view submissions for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, assignment.classId))) {
             return policy.forbidden(res, "This homework is outside your selected portal context.");
@@ -533,7 +593,7 @@ router.get("/:id/submissions", requireAuth, requireRole(...STAFF_ROLES), async (
             })
             .from(submissions)
             .innerJoin(user, eq(submissions.studentId, user.id))
-            .where(eq(submissions.assignmentId, assignmentId))
+            .where(and(eq(submissions.assignmentId, assignmentId), policy.isTeacher(req.user!) ? eq(user.role, "student") : undefined))
             .orderBy(desc(submissions.submittedAt));
 
         res.status(200).json({ data: rows });
@@ -549,7 +609,7 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
         const submissionId = Number(req.params.submissionId);
         if (!Number.isFinite(submissionId)) return res.status(400).json({ error: "Invalid submission id" });
 
-        if (policy.isTeacher(req.user!)) {
+        if (policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) {
             const [existingSubmission] = await db
                 .select({ classId: assignments.classId })
                 .from(submissions)
@@ -557,7 +617,7 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
                 .where(eq(submissions.id, submissionId));
             if (!existingSubmission) return res.status(404).json({ error: "Submission not found" });
             if (!(await policy.canManageClass(req.user!, existingSubmission.classId))) {
-                return policy.forbidden(res, "You can only grade submissions for classes you teach.");
+                return policy.forbidden(res, "You can only grade submissions for classes in your school.");
             }
             if (!(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, existingSubmission.classId))) {
                 return policy.forbidden(res, "This homework is outside your selected portal context.");
@@ -592,11 +652,12 @@ router.put("/submissions/:submissionId/grade", requireAuth, requireRole(...STAFF
         });
 
         // Send grade email to student
-        const [studentUser] = await db.select({ email: user.email, name: user.name })
+        const [studentUser] = await db.select({ id: user.id, email: user.email, name: user.name })
             .from(user).where(eq(user.id, updated.studentId));
         const [assignment] = await db.select({ title: assignments.title, maxScore: assignments.maxScore })
             .from(assignments).where(eq(assignments.id, updated.assignmentId));
-        if (studentUser?.email && assignment) {
+        const emailEnabledIds = studentUser ? await filterNotificationRecipients([studentUser.id], "email") : [];
+        if (studentUser?.email && assignment && emailEnabledIds.length > 0) {
             const feedbackStr = typeof feedback === "string" && feedback ? feedback : undefined;
             sendGradeEmail({
                 to: studentUser.email,

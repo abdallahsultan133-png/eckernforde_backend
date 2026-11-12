@@ -9,9 +9,10 @@ import {
     varchar,
     index,
     primaryKey,
-    boolean
+    boolean,
+    check
 } from "drizzle-orm/pg-core";
-import {relations} from "drizzle-orm";
+import {relations, sql} from "drizzle-orm";
 import {user} from "./auth.js";
 
 export const classStatusEnum = pgEnum('class_status', ['active', 'inactive', 'archived']);
@@ -55,9 +56,14 @@ export const subjects = pgTable('subjects', {
     // being deleted rather than cascading. Only the creating teacher (or an
     // admin) may edit — see the ownership check in routes/subjects.ts.
     createdBy: text('created_by').references(() => user.id, { onDelete: 'set null' }),
+    // A new subject is visible in its creator's selected teaching context
+    // before a class has been attached to it.
+    creationAcademicYearId: integer('creation_academic_year_id').references(() => academicYears.id, { onDelete: 'restrict' }),
+    creationStage: varchar('creation_stage', { length: 30 }),
     ...timestamps
 }, (table) => [
     index('subjects_department_id_idx').on(table.departmentId),
+    index('subjects_creation_context_idx').on(table.creationAcademicYearId, table.creationStage),
 ]);
 
 export const classes = pgTable('classes', {
@@ -83,6 +89,7 @@ export const classes = pgTable('classes', {
     index('classes_subject_id_idx').on(table.subjectId),
     index('classes_teacher_id_idx').on(table.teacherId),
     index('classes_academic_year_id_idx').on(table.academicYearId),
+    check('classes_reporting_context_required', sql`${table.schoolLevel} is not null and ${table.academicYearId} is not null`),
 ]);
 
 export const enrollments = pgTable('enrollments', {
@@ -300,7 +307,7 @@ export const termSubjectResults = pgTable('term_subject_results', {
     enteredBy: text('entered_by').notNull().references(() => user.id, { onDelete: 'restrict' }),
     ...timestamps,
 }, (table) => [
-    unique('term_subject_results_term_class_student_unique').on(table.academicTermId, table.classId, table.studentId),
+    unique('term_subject_results_term_class_subject_student_unique').on(table.academicTermId, table.classId, table.subjectId, table.studentId),
     index('term_subject_results_term_student_idx').on(table.academicTermId, table.studentId),
     index('term_subject_results_class_id_idx').on(table.classId),
 ]);
@@ -622,6 +629,26 @@ export const auditLogs = pgTable('audit_logs', {
 ]);
 
 export type AuditLog = typeof auditLogs.$inferSelect;
+
+// Password-recovery requests are kept separately from the Better Auth
+// verification token. The token remains private and expires; this table gives
+// super administrators a safe operational queue without ever storing a
+// password or reset token.
+export const passwordResetRequests = pgTable('password_reset_requests', {
+    id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+    userId: text('user_id').references(() => user.id, { onDelete: 'set null' }),
+    email: varchar('email', { length: 320 }).notNull(),
+    status: varchar('status', { length: 32 }).default('pending').notNull(),
+    requestedAt: timestamp('requested_at').defaultNow().notNull(),
+    handledAt: timestamp('handled_at'),
+    handledBy: text('handled_by').references(() => user.id, { onDelete: 'set null' }),
+}, (table) => [
+    index('password_reset_requests_status_idx').on(table.status),
+    index('password_reset_requests_requested_at_idx').on(table.requestedAt),
+    index('password_reset_requests_user_id_idx').on(table.userId),
+]);
+
+export type PasswordResetRequest = typeof passwordResetRequests.$inferSelect;
 
 // ─── QR ATTENDANCE SESSIONS ───────────────────────────────────────────────────
 // A teacher generates a short-lived token; students scan the QR and

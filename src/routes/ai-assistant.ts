@@ -2,7 +2,7 @@ import express from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
-import { and, desc, eq, ilike, or } from "drizzle-orm";
+import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import { db } from "../db/index.js";
 import {
     studentProfiles,
@@ -20,11 +20,12 @@ import { validateBody } from "../middleware/validate.js";
 import { aiChatSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import { getAnthropicClient } from "../lib/anthropic.js";
+import * as policy from "../lib/policy.js";
 
 const router = express.Router();
 
 // ─── DATA-GATHERING HELPERS (mirror profile.ts's /student/:studentId, extended) ─
-async function searchStudents(query: string) {
+async function searchStudents(query: string, schoolLevel: policy.HeadmasterSchoolLevel | null) {
     const q = query.trim();
     if (!q) return [];
 
@@ -34,7 +35,11 @@ async function searchStudents(query: string) {
         .select({ id: user.id, name: user.name, email: user.email, registrationNumber: studentProfiles.registrationNumber })
         .from(user)
         .leftJoin(studentProfiles, eq(studentProfiles.userId, user.id))
-        .where(and(eq(user.role, "student"), eq(user.id, q)))
+        .where(and(
+            eq(user.role, "student"),
+            eq(user.id, q),
+            schoolLevel ? sql`exists (select 1 from enrollments e inner join classes c on c.id = e.class_id where e.student_id = ${user.id} and c.school_level = ${schoolLevel})` : undefined,
+        ))
         .limit(1);
     if (byId.length > 0) return byId;
 
@@ -45,6 +50,7 @@ async function searchStudents(query: string) {
         .where(
             and(
                 eq(user.role, "student"),
+                schoolLevel ? sql`exists (select 1 from enrollments e inner join classes c on c.id = e.class_id where e.student_id = ${user.id} and c.school_level = ${schoolLevel})` : undefined,
                 or(
                     ilike(user.name, `%${q}%`),
                     ilike(user.email, `%${q}%`),
@@ -55,12 +61,16 @@ async function searchStudents(query: string) {
         .limit(10);
 }
 
-async function getStudentFullProfile(studentId: string) {
+async function getStudentFullProfile(studentId: string, schoolLevel: policy.HeadmasterSchoolLevel | null) {
     const [studentUser] = await db
         .select({ id: user.id, name: user.name, email: user.email, role: user.role })
         .from(user)
         .where(eq(user.id, studentId));
     if (!studentUser || studentUser.role !== "student") {
+        return { error: "No student found with that ID." };
+    }
+
+    if (schoolLevel && !(await policy.canAccessStudent({ role: schoolLevel === "primary" ? "primary_headmaster" : "secondary_headmaster" }, studentId))) {
         return { error: "No student found with that ID." };
     }
 
@@ -136,7 +146,7 @@ async function getStudentFullProfile(studentId: string) {
 }
 
 // ─── TOOLS ──────────────────────────────────────────────────────────────────────
-const searchStudentsTool = betaZodTool({
+const createSearchStudentsTool = (schoolLevel: policy.HeadmasterSchoolLevel | null) => betaZodTool({
     name: "search_students",
     description:
         "Search for a student by full or partial name, email, registration number, or an exact student user ID. " +
@@ -146,12 +156,12 @@ const searchStudentsTool = betaZodTool({
         query: z.string().describe("Name, partial name, email, registration number, or an exact student ID."),
     }),
     run: async ({ query }) => {
-        const results = await searchStudents(query);
+        const results = await searchStudents(query, schoolLevel);
         return JSON.stringify(results.length > 0 ? results : { message: "No matching students found." });
     },
 });
 
-const getStudentProfileTool = betaZodTool({
+const createStudentProfileTool = (schoolLevel: policy.HeadmasterSchoolLevel | null) => betaZodTool({
     name: "get_student_full_profile",
     description:
         "Fetch one student's complete record: profile fields, enrolled classes, per-class grades, an attendance " +
@@ -160,7 +170,7 @@ const getStudentProfileTool = betaZodTool({
     inputSchema: z.object({
         studentId: z.string().describe("The exact student user ID, e.g. from a prior search_students call."),
     }),
-    run: async ({ studentId }) => JSON.stringify(await getStudentFullProfile(studentId)),
+    run: async ({ studentId }) => JSON.stringify(await getStudentFullProfile(studentId, schoolLevel)),
 });
 
 const SYSTEM_PROMPT = `You are the AI Student Assistant inside the school platform. You are used only by authorized school administrators looking up student information.
@@ -198,12 +208,13 @@ router.post(
                 { role: "user", content: message },
             ];
 
+            const schoolLevel = policy.headmasterSchoolLevel(req.user!);
             const finalMessage = await client.beta.messages.toolRunner({
                 model: "claude-opus-5",
                 max_tokens: 2048,
                 system: SYSTEM_PROMPT,
                 output_config: { effort: "medium" },
-                tools: [searchStudentsTool, getStudentProfileTool],
+                tools: [createSearchStudentsTool(schoolLevel), createStudentProfileTool(schoolLevel)],
                 messages,
             });
 

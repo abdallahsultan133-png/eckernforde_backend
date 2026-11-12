@@ -1,4 +1,5 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { count, eq } from "drizzle-orm";
 
 import { db } from "../db/index.js";
@@ -9,6 +10,7 @@ import { createDepartmentSchema, updateDepartmentSchema } from "../lib/schemas.j
 import { logAction } from "./audit-logs.js";
 
 const router = express.Router();
+const generatedDepartmentCode = () => `DEPT-${randomUUID().replace(/-/g, "").slice(0, 16).toUpperCase()}`;
 
 router.get("/", requireAuth, async (_req, res) => {
     try {
@@ -24,10 +26,10 @@ router.get("/", requireAuth, async (_req, res) => {
 // POST /api/departments — admin only
 router.post("/", requireAuth, requireRole(...ADMIN_ROLES), validateBody(createDepartmentSchema), async (req, res) => {
     try {
-        const { name, code, description } = req.body as { name: string; code: string; description?: string | null };
+        const { name, code, description } = req.body as { name: string; code?: string; description?: string | null };
         const [created] = await db
             .insert(departments)
-            .values({ name: name.trim(), code: code.trim(), description: description ?? null })
+            .values({ name: name.trim(), code: code?.trim() ?? generatedDepartmentCode(), description: description ?? null })
             .returning();
         await logAction({ req, action: "department.create", resource: "departments", resourceId: created?.id, details: `Created department "${name.trim()}"` });
         res.status(201).json({ data: created });
