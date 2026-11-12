@@ -1,9 +1,9 @@
 import cron from "node-cron";
 import { and, eq, gte, lt } from "drizzle-orm";
 import { db } from "../db/index.js";
-import { classes, enrollments, exams } from "../db/schema/app.js";
-import { user } from "../db/schema/auth.js";
+import { classes, exams } from "../db/schema/app.js";
 import { sendExamReminderEmail } from "./email.js";
+import { classNotificationRecipients, filterNotificationRecipients } from "./user-notification-preferences.js";
 
 // Finds every exam scheduled for tomorrow and emails everyone enrolled in its
 // class. Runs once a day — deliberately not idempotency-guarded beyond that
@@ -33,13 +33,10 @@ async function sendTomorrowsExamReminders() {
         for (const exam of upcoming) {
             if (!exam.scheduledAt) continue;
 
-            const enrolled = await db
-                .select({ email: user.email })
-                .from(enrollments)
-                .innerJoin(user, eq(enrollments.studentId, user.id))
-                .where(eq(enrollments.classId, exam.classId));
+            const enrolled = await classNotificationRecipients(exam.classId);
 
-            const emails = enrolled.map((e) => e.email).filter(Boolean) as string[];
+            const emailEnabledIds = new Set(await filterNotificationRecipients(enrolled.map((student) => student.id), "email"));
+            const emails = enrolled.filter((student) => emailEnabledIds.has(student.id)).map((student) => student.email).filter(Boolean) as string[];
             if (emails.length === 0) continue;
 
             await sendExamReminderEmail({

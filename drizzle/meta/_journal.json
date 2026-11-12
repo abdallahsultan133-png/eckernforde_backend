@@ -211,6 +211,76 @@
       "when": 1791158400000,
       "tag": "0029_role_login_controls",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1791244800000,
+      "tag": "0030_classify_legacy_catalogue",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1791331200000,
+      "tag": "0031_headmaster_roles",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1791417600000,
+      "tag": "0032_repair_known_admin_accounts",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1791504000000,
+      "tag": "0033_password_reset_requests",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1791590400000,
+      "tag": "0034_term_results_include_subject",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1791676800000,
+      "tag": "0035_classify_teacher_form_classes",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1791763200000,
+      "tag": "0036_require_class_reporting_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1791849600000,
+      "tag": "0037_validate_class_reporting_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1791936000000,
+      "tag": "0038_subject_creation_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1792022400000,
+      "tag": "0039_account_notification_preferences",
+      "breakpoints": true
     }
   ]
 }

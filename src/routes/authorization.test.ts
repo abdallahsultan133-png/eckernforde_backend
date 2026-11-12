@@ -30,7 +30,7 @@ import type { SQL } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ── DB mock ──────────────────────────────────────────────────────────────────
-const dbState = vi.hoisted(() => ({ queue: [] as unknown[], predicates: [] as SQL[] }));
+const dbState = vi.hoisted(() => ({ queue: [] as unknown[], predicates: [] as SQL[], insertedValues: [] as unknown[] }));
 
 vi.mock("../db/index.js", () => {
     const pull = (fallback: unknown) => (dbState.queue.length ? dbState.queue.shift() : fallback);
@@ -42,6 +42,7 @@ vi.mock("../db/index.js", () => {
         new Proxy(function () {}, {
             get(_target, prop) {
                 if (prop === "where") return (predicate: SQL) => { if (predicate) dbState.predicates.push(predicate); return chain(fallback); };
+                if (prop === "values") return (values: unknown) => { dbState.insertedValues.push(values); return chain(fallback); };
                 if (prop === "then") {
                     return (ok: (v: unknown) => unknown, err?: (e: unknown) => unknown) =>
                         Promise.resolve(pull(fallback)).then(ok, err);
@@ -59,6 +60,7 @@ vi.mock("../db/index.js", () => {
             delete: () => chain([{ id: 1 }]),
             execute: async () => ({ rows: [] }),
             transaction: async (callback: (transaction: any) => unknown) => callback({
+                select: () => chain([]),
                 update: () => chain([{ id: 1 }]),
                 insert: () => chain([{ id: 1 }]),
             }),
@@ -103,8 +105,10 @@ function queueDb(...values: unknown[]) {
 const { default: auditLogsRouter } = await import("./audit-logs.js");
 const { default: usersRouter } = await import("./users.js");
 const { default: classesRouter } = await import("./classes.js");
+const { default: subjectsRouter } = await import("./subjects.js");
 const { default: gradesRouter } = await import("./grades.js");
 const { default: attendanceRouter } = await import("./attendance.js");
+const { default: assignmentsRouter } = await import("./assignments.js");
 const { default: calendarRouter } = await import("./calendar.js");
 const { default: announcementsRouter } = await import("./announcements.js");
 const { default: admissionsRouter } = await import("./admissions.js");
@@ -121,7 +125,8 @@ const USERS = {
     parent:     { id: "parent-1",  name: "Pat Parent",   email: "pat@school.test",  role: "parent" },
     teacher:    { id: "teacher-1", name: "Tess Teacher", email: "tess@school.test", role: "teacher" },
     teacher2:   { id: "teacher-2", name: "Ty Teacher",   email: "ty@school.test",   role: "teacher" },
-    admin:      { id: "admin-1",   name: "Ada Admin",    email: "ada@school.test",  role: "admin" },
+    admin:      { id: "admin-1",   name: "Ada Super Admin", email: "ada@school.test", role: "super_admin" },
+    headmaster: { id: "hm-1",      name: "Hana Secondary Headmaster", email: "hana@school.test", role: "secondary_headmaster" },
     superAdmin: { id: "super-1",   name: "Sue Super",    email: "sue@school.test",  role: "super_admin" },
 } as const;
 
@@ -143,8 +148,10 @@ beforeAll(async () => {
     app.use("/api/audit-logs", auditLogsRouter);
     app.use("/api/users", usersRouter);
     app.use("/api/classes", classesRouter);
+    app.use("/api/subjects", subjectsRouter);
     app.use("/api/grades", gradesRouter);
     app.use("/api/attendance", attendanceRouter);
+    app.use("/api/homework", assignmentsRouter);
     app.use("/api/calendar", calendarRouter);
     app.use("/api/announcements", announcementsRouter);
     app.use("/api/admissions", admissionsRouter);
@@ -164,6 +171,7 @@ afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 beforeEach(() => {
     dbState.queue.length = 0;
     dbState.predicates.length = 0;
+    dbState.insertedValues.length = 0;
 });
 
 async function call(
@@ -239,8 +247,8 @@ describe("PATCH /api/users/:id/role — privilege-escalation guard", () => {
     });
 
     it("an admin CANNOT promote anyone to admin or super_admin", async () => {
-        for (const role of ["admin", "super_admin"] as const) {
-            const r = await call("PATCH", "/api/users/u9/role", { as: USERS.admin, body: { role } });
+        for (const role of ["primary_headmaster", "secondary_headmaster", "super_admin"] as const) {
+            const r = await call("PATCH", "/api/users/u9/role", { as: USERS.headmaster, body: { role } });
             expect(r.status).toBe(403);
         }
     });
@@ -253,7 +261,7 @@ describe("PATCH /api/users/:id/role — privilege-escalation guard", () => {
     });
 
     it("a super_admin CAN grant admin-level roles", async () => {
-        const r = await call("PATCH", "/api/users/u9/role", { as: USERS.superAdmin, body: { role: "admin" } });
+        const r = await call("PATCH", "/api/users/u9/role", { as: USERS.superAdmin, body: { role: "primary_headmaster" } });
         expect(r.status).toBe(200);
     });
 });
@@ -302,12 +310,12 @@ describe("POST /api/users/:id/reset-password — admin password reset", () => {
 
     it("a plain admin CANNOT reset an admin-level account", async () => {
         queueDb([{ ...target, role: "super_admin" }]);
-        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.admin, body: { mode: "email" } });
+        const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.headmaster, body: { mode: "email" } });
         expect(r.status).toBe(403);
     });
 
     it("a super_admin CAN reset an admin's password", async () => {
-        queueDb([{ ...target, role: "admin" }]);
+        queueDb([{ ...target, role: "secondary_headmaster" }]);
         const r = await call("POST", "/api/users/u9/reset-password", { as: USERS.superAdmin, body: { mode: "email" } });
         expect(r.status).toBe(200);
     });
@@ -345,11 +353,11 @@ describe("DELETE /api/users/:id — admin user deletion", () => {
 
     it("a plain admin CANNOT delete an admin-level account", async () => {
         queueDb([{ ...target, role: "super_admin" }]);
-        expect((await call("DELETE", "/api/users/u9", { as: USERS.admin })).status).toBe(403);
+        expect((await call("DELETE", "/api/users/u9", { as: USERS.headmaster })).status).toBe(403);
     });
 
     it("a super_admin CAN delete an admin", async () => {
-        queueDb([{ ...target, role: "admin" }]);
+        queueDb([{ ...target, role: "secondary_headmaster" }]);
         expect((await call("DELETE", "/api/users/u9", { as: USERS.superAdmin })).status).toBe(200);
     });
 });
@@ -365,6 +373,20 @@ describe("users directory endpoints", () => {
         expect((await call("GET", "/api/users/students", { as: USERS.student })).status).toBe(403);
         expect((await call("GET", "/api/users/students", { as: USERS.parent })).status).toBe(403);
         expect((await call("GET", "/api/users/students", { as: USERS.teacher })).status).toBe(200);
+    });
+
+    it("includes stage-matched students without requiring a separate school-level enrollment", async () => {
+        const response = await call(
+            "GET",
+            "/api/users/students?schoolLevel=secondary&stage=form_i&academicYearId=8",
+            { as: USERS.superAdmin },
+        );
+
+        expect(response.status).toBe(200);
+        // The stage-specific matching has portal-context and enrollment
+        // predicates; a third broad enrollment predicate would exclude
+        // students whose selected form is saved but who lack class enrollment.
+        expect(dbState.predicates).toHaveLength(4);
     });
 
     it("GET /api/users/teachers is any signed-in user, but not the public", async () => {
@@ -410,28 +432,36 @@ describe("class management — role + ownership", () => {
         expect((await call("POST", "/api/classes", { as: USERS.student, body: {} })).status).toBe(403);
     });
 
-    it("a teacher can create a class", async () => {
+    it("a teacher's new Form class is classified for formal results", async () => {
+        queueDb([{ id: 2, name: "2026/2027", startsOn: "2026-01-01", endsOn: "2099-12-31", active: true }]);
         const r = await call("POST", "/api/classes", {
             as: USERS.teacher,
-            body: { name: "Chemistry 1", subjectId: 1, teacherId: "ignored" },
+            body: { name: "Form I", subjectId: 1, teacherId: "ignored" },
         });
         expect(r.status).toBe(201);
+        expect(dbState.insertedValues[0]).toMatchObject({ schoolLevel: "secondary", academicYearId: 2, teacherId: USERS.teacher.id });
     });
 
     it("a teacher can edit only a class they teach", async () => {
-        queueDb([{ id: 1, teacherId: USERS.teacher2.id }]); // owned by someone else
+        queueDb([{ id: 1, name: "Form I", schoolLevel: "secondary", academicYearId: 2, teacherId: USERS.teacher2.id }]); // owned by someone else
         const denied = await call("PUT", "/api/classes/1", { as: USERS.teacher, body: { name: "Renamed" } });
         expect(denied.status).toBe(403);
 
-        queueDb([{ id: 1, teacherId: USERS.teacher.id }]); // owned by the caller
+        queueDb([{ id: 1, name: "Form I", schoolLevel: "secondary", academicYearId: 2, teacherId: USERS.teacher.id }]); // owned by the caller
         const ok = await call("PUT", "/api/classes/1", { as: USERS.teacher, body: { name: "Renamed" } });
         expect(ok.status).toBe(200);
     });
 
     it("an admin can edit any class", async () => {
-        queueDb([{ id: 1, teacherId: USERS.teacher2.id }]);
+        queueDb([{ id: 1, name: "Form I", schoolLevel: "secondary", academicYearId: 2, teacherId: USERS.teacher2.id }]);
         const r = await call("PUT", "/api/classes/1", { as: USERS.admin, body: { name: "Renamed" } });
         expect(r.status).toBe(200);
+    });
+
+    it("cannot clear the school level from an existing class", async () => {
+        queueDb([{ id: 1, name: "Form I", schoolLevel: "secondary", academicYearId: 2, teacherId: USERS.teacher.id }]);
+        const r = await call("PUT", "/api/classes/1", { as: USERS.admin, body: { schoolLevel: null } });
+        expect(r.status).toBe(400);
     });
 
     it("a missing class is 404, not 403 (existence checked before ownership)", async () => {
@@ -454,6 +484,9 @@ describe("class roster visibility — GET /api/classes/:id/students", () => {
 
         queueDb([{ id: 1 }]); // owns it
         expect((await call("GET", "/api/classes/1/students", { as: USERS.teacher })).status).toBe(200);
+        const rosterFilter = new PgDialect().sqlToQuery(dbState.predicates.at(-1)!);
+        expect(rosterFilter.sql).toContain('"user"."role"');
+        expect(rosterFilter.params).toContain("student");
     });
 
     it("a student sees the roster only for a class they're enrolled in", async () => {
@@ -507,6 +540,37 @@ describe("grades — staff role + class ownership", () => {
         expect(r.status).toBe(201);
     });
 
+    it("does not claim an exam save succeeded for an unclassified class", async () => {
+        queueDb(
+            [{ classId: 11, maxScore: 100, examType: "midterm", className: "Form I", subjectName: "Civics", subjectId: 22, schoolLevel: null, academicYearId: 2 }],
+            [{ id: 11 }],
+        );
+        const result = await call("POST", "/api/grades/exams/26/results", {
+            as: USERS.teacher,
+            body: { records: [{ studentId: USERS.student.id, score: 72 }] },
+        });
+        expect(result.status).toBe(409);
+        expect(dbState.insertedValues).toHaveLength(0);
+    });
+
+    it("saves exam marks and pending report marks together", async () => {
+        queueDb(
+            [{ classId: 11, maxScore: 100, examType: "midterm", className: "Form I", subjectName: "Civics", subjectId: 22, schoolLevel: "secondary", academicYearId: 2 }],
+            [{ id: 11 }],
+            [{ id: 2 }],
+            [{ studentId: USERS.student.id }],
+            [],
+            [],
+        );
+        const result = await call("POST", "/api/grades/exams/26/results", {
+            as: USERS.teacher,
+            body: { records: [{ studentId: USERS.student.id, score: 72 }] },
+        });
+        expect(result.status).toBe(200);
+        expect(dbState.insertedValues[0]).toEqual([{ examId: 26, studentId: USERS.student.id, score: 72, remarks: null, gradedBy: USERS.teacher.id }]);
+        expect(dbState.insertedValues[1]).toMatchObject([{ academicTermId: 2, classId: 11, subjectId: 22, schoolLevel: "secondary", score: 72, published: false }]);
+    });
+
     it("saving gradebook grades is staff only and teacher-scoped", async () => {
         const noRole = await call("POST", "/api/grades/gradebook/5/save", { as: USERS.student, body: {} });
         expect(noRole.status).toBe(403);
@@ -527,9 +591,22 @@ describe("grades — staff role + class ownership", () => {
         expect((await call("GET", "/api/grades/gradebook/5", { as: USERS.student })).status).toBe(200);
     });
 
+    it("GET /api/grades/gradebook/all-subjects is student-only", async () => {
+        expect((await call("GET", "/api/grades/gradebook/all-subjects")).status).toBe(401);
+        expect((await call("GET", "/api/grades/gradebook/all-subjects", { as: USERS.teacher })).status).toBe(403);
+        expect((await call("GET", "/api/grades/gradebook/all-subjects", { as: USERS.student })).status).toBe(200);
+    });
+
     it("GET /api/grades/gradebook/:classId — a parent needs a child in the class", async () => {
-        queueDb([]); // getLinkedChildIds → none
-        expect((await call("GET", "/api/grades/gradebook/5", { as: USERS.parent })).status).toBe(403);
+        expect((await call("GET", "/api/grades/gradebook/5", { as: USERS.parent })).status).toBe(400);
+
+        queueDb([]); // no linked child
+        expect((await call("GET", "/api/grades/gradebook/5?childId=child-1&academicYearId=2", { as: USERS.parent })).status).toBe(403);
+
+        queueDb([{ userId: "child-1" }]);
+        queueDb([{ academicYearId: 2 }]);
+        queueDb([{ studentId: "child-1" }]);
+        expect((await call("GET", "/api/grades/gradebook/5?childId=child-1&academicYearId=2", { as: USERS.parent })).status).toBe(200);
     });
 
     it("GET /api/grades/exams is open to any authenticated user", async () => {
@@ -555,6 +632,19 @@ describe("attendance — marking is staff + class-scoped", () => {
 
     it("an admin can mark attendance for any class", async () => {
         expect((await call("POST", "/api/attendance", { as: USERS.admin, body })).status).toBe(200);
+    });
+});
+
+describe("attendance reports — only current students", () => {
+    it("filters changed-role users from the Super Admin report and date range", async () => {
+        const result = await call("GET", "/api/attendance/class/5/report", { as: USERS.superAdmin });
+
+        expect(result.status).toBe(200);
+        const clauses = dbState.predicates.map((predicate) => new PgDialect().sqlToQuery(predicate));
+        const studentRoleFilters = clauses.filter((clause) =>
+            clause.sql.includes('"role"') && clause.params.includes("student"),
+        );
+        expect(studentRoleFilters).toHaveLength(2);
     });
 });
 
@@ -656,8 +746,119 @@ describe("public content publication boundaries", () => {
     });
 });
 
+describe("parent attendance records", () => {
+    it("loads the selected child's attendance in the selected academic year", async () => {
+        queueDb(
+            [{ parentUserId: USERS.parent.id, parentEmail: null }],
+            [{ id: 2, startsOn: "2026-01-01", endsOn: "2026-12-31" }],
+            [{ id: 1, classId: 11, subjectName: "Civics", date: "2026-10-01", status: "present" }],
+        );
+        const result = await call("GET", "/api/attendance/student/child-1?academicYearId=2&limit=2000", { as: USERS.parent });
+        expect(result.status).toBe(200);
+        expect(result.body.data).toMatchObject([{ subjectName: "Civics", status: "present" }]);
+        const historySql = new PgDialect().sqlToQuery(dbState.predicates.at(-1)!).sql;
+        expect(historySql).toContain("academic_year_id");
+        expect(historySql).toContain("date");
+    });
+
+    it("does not expose attendance for a child linked to a different parent", async () => {
+        queueDb([{ parentUserId: "different-parent", parentEmail: USERS.parent.email }]);
+        const result = await call("GET", "/api/attendance/student/child-1?academicYearId=2", { as: USERS.parent });
+        expect(result.status).toBe(403);
+    });
+});
+
+describe("parent homework records", () => {
+    it("shows the selected child's submission status in the homework list", async () => {
+        queueDb(
+            [{ userId: "child-1" }],
+            [{ classId: 11 }],
+            [{ id: 8, title: "Civics essay", class: { id: 11, name: "Form I" }, subject: { id: 4, name: "Civics" }, creator: { id: USERS.teacher.id, name: USERS.teacher.name } }],
+            [{ assignmentId: 8, total: 1, graded: 1 }],
+            [{ assignmentId: 8, status: "graded", score: 18 }],
+        );
+        const result = await call("GET", "/api/homework?childId=child-1&academicYearId=2", { as: USERS.parent });
+        expect(result.status).toBe(200);
+        expect(result.body.data[0].mySubmission).toEqual({ status: "graded", score: 18 });
+    });
+
+    it("does not show homework for another parent's child", async () => {
+        queueDb([{ userId: "child-1" }]);
+        const result = await call("GET", "/api/homework?childId=other-child&academicYearId=2", { as: USERS.parent });
+        expect(result.status).toBe(403);
+    });
+
+    it("opens only the selected linked child's homework and submission", async () => {
+        queueDb(
+            [{ id: 8, classId: 11, classAcademicYearId: 2, class: { id: 11, name: "Form I" } }],
+            [{ userId: "child-1" }],
+            [{ studentId: "child-1" }],
+            [{ id: 50, studentId: "child-1", assignmentId: 8, status: "graded", score: 18 }],
+        );
+        const result = await call("GET", "/api/homework/8?childId=child-1&academicYearId=2", { as: USERS.parent });
+        expect(result.status).toBe(200);
+        expect(result.body.data.mySubmission).toMatchObject({ studentId: "child-1", score: 18 });
+    });
+
+    it("rejects a homework detail outside the selected academic year", async () => {
+        queueDb(
+            [{ id: 8, classId: 11, classAcademicYearId: 1, class: { id: 11, name: "Form I" } }],
+            [{ userId: "child-1" }],
+            [{ studentId: "child-1" }],
+        );
+        const result = await call("GET", "/api/homework/8?childId=child-1&academicYearId=2", { as: USERS.parent });
+        expect(result.status).toBe(404);
+    });
+});
+
+describe("student homework access", () => {
+    it("does not open homework from a class the student has not joined", async () => {
+        queueDb([{ id: 8, classId: 11, class: { id: 11, name: "Form I" } }], []);
+        expect((await call("GET", "/api/homework/8", { as: USERS.student })).status).toBe(403);
+    });
+
+    it("keeps class-filtered homework lists inside the student's enrollments", async () => {
+        queueDb([]);
+        const result = await call("GET", "/api/homework?classId=11", { as: USERS.student });
+        expect(result.status).toBe(200);
+        expect(result.body.data).toEqual([]);
+        expect(new PgDialect().sqlToQuery(dbState.predicates.at(-1)!).sql).toContain("false");
+    });
+});
+
+describe("teacher subject creation context", () => {
+    const body = { name: "Civics", departmentId: 1 };
+
+    it("saves a new subject in the selected academic year and form", async () => {
+        queueDb(
+            [{ id: 2, name: "2026", startsOn: "2026-01-01", endsOn: "2026-12-31", active: true }],
+            [{ stage: "form_i" }],
+            [],
+        );
+        const result = await call("POST", "/api/subjects", { as: USERS.teacher, body });
+        expect(result.status).toBe(201);
+        expect(dbState.insertedValues).toContainEqual(expect.objectContaining({
+            name: "Civics", createdBy: USERS.teacher.id,
+            creationAcademicYearId: 2, creationStage: "form_i",
+        }));
+    });
+
+    it("does not create a subject without a selected form", async () => {
+        queueDb([{ id: 2, name: "2026", startsOn: "2026-01-01", endsOn: "2026-12-31", active: true }], []);
+        const result = await call("POST", "/api/subjects", { as: USERS.teacher, body });
+        expect(result.status).toBe(409);
+        expect(dbState.insertedValues).toHaveLength(0);
+    });
+});
+
 describe("formal term-result publication — admin only", () => {
     const body = { academicTermId: 1, classId: 1, published: true };
+
+    it("restricts the publication class list to administrators", async () => {
+        expect((await call("GET", "/api/grades/publishable-classes", { as: USERS.student })).status).toBe(403);
+        expect((await call("GET", "/api/grades/publishable-classes", { as: USERS.teacher })).status).toBe(403);
+        expect((await call("GET", "/api/grades/publishable-classes", { as: USERS.headmaster })).status).toBe(200);
+    });
 
     it("rejects unauthenticated and teacher publication attempts", async () => {
         expect((await call("POST", "/api/grades/term-results/publish", { body })).status).toBe(401);
@@ -666,9 +867,22 @@ describe("formal term-result publication — admin only", () => {
     });
 
     it("allows an administrator to publish a class-term result set", async () => {
+        queueDb(
+            [{ type: "midterm", academicYearId: 2 }],
+            [{ name: "Form I", subjectId: 22, schoolLevel: "secondary", academicYearId: 2 }],
+        );
         const result = await call("POST", "/api/grades/term-results/publish", { as: USERS.admin, body });
         expect(result.status).toBe(200);
         expect(result.body.data.published).toBe(true);
+    });
+
+    it("rejects publication into a different academic year", async () => {
+        queueDb(
+            [{ type: "midterm", academicYearId: 1 }],
+            [{ name: "Form I", subjectId: 22, schoolLevel: "secondary", academicYearId: 2 }],
+        );
+        const result = await call("POST", "/api/grades/term-results/publish", { as: USERS.admin, body });
+        expect(result.status).toBe(409);
     });
 });
 
@@ -849,21 +1063,31 @@ describe("academic-year activation", () => {
         expect((await call("PATCH", path, { as: USERS.teacher })).status).toBe(403);
     });
 
-    it("activates a configured year only within its dates", async () => {
+    it("can schedule a configured future year before its dates", async () => {
         queueDb([{ id: 7, name: "Future", startsOn: "2099-01-01", endsOn: "2099-12-31" }]);
-        expect((await call("PATCH", path, { as: USERS.admin })).status).toBe(400);
+        expect((await call("PATCH", path, { as: USERS.admin })).status).toBe(200);
         queueDb([{ id: 7, name: "Current", startsOn: "2000-01-01", endsOn: "2099-12-31" }]);
         expect((await call("PATCH", path, { as: USERS.admin })).status).toBe(200);
     });
 
-    it("creates a future year without making it current", async () => {
+    it("allows admins to schedule a future year for automatic rollover", async () => {
         const future = { name: "2099/2100", startsOn: "2099-01-01", endsOn: "2099-12-31" };
-        expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: { ...future, active: true } })).status).toBe(400);
+        expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: { ...future, active: true } })).status).toBe(201);
         expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: { ...future, active: false } })).status).toBe(201);
     });
 
     it("requires calendar-year academic dates", async () => {
         const invalid = { name: "2099/2100", startsOn: "2099-01-02", endsOn: "2099-12-31", active: false };
         expect((await call("POST", "/api/grades/academic-years", { as: USERS.admin, body: invalid })).status).toBe(400);
+    });
+});
+
+describe("academic-year deletion", () => {
+    const path = "/api/grades/academic-years/7";
+
+    it("is restricted to super administrators", async () => {
+        expect((await call("DELETE", path)).status).toBe(401);
+        expect((await call("DELETE", path, { as: USERS.teacher })).status).toBe(403);
+        expect((await call("DELETE", path, { as: USERS.headmaster })).status).toBe(403);
     });
 });

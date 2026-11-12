@@ -1,12 +1,14 @@
 import { Router } from "express";
-import { and, count, countDistinct, eq, gt, gte, lt, isNull, inArray, or, sql, desc } from "drizzle-orm";
+import { and, count, countDistinct, eq, gt, gte, ilike, lt, isNull, inArray, or, sql, desc } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { user } from "../db/schema/auth.js";
-import { classes, subjects, departments, enrollments, attendance, assignments, announcements, submissions, classGrades } from "../db/schema/app.js";
+import { academicTerms, classes, subjects, departments, enrollments, attendance, assignments, announcements, submissions, classGrades, termSubjectResults } from "../db/schema/app.js";
 import { requireAuth } from "../middleware/require-auth.js";
 import { shortCache } from "../middleware/cache.js";
 import { activePortalClassIds } from "../lib/portal-context.js";
+import * as policy from "../lib/policy.js";
+import { gradeSecondaryScore } from "../lib/grading/student-division.js";
 
 const dashboardRouter = Router();
 
@@ -36,11 +38,47 @@ const pctChange = (current: number, previous: number): number | null => {
     return Math.round(((current - previous) / previous) * 1000) / 10;
 };
 
+function readAcademicYearId(value: unknown): number | null | undefined {
+    if (value === undefined) return undefined;
+    const id = Number(value);
+    return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function dashboardStageScope(value: unknown) {
+    if (value === undefined) return undefined;
+    const stage = String(value).trim().toLowerCase();
+    const patterns: Record<string, string[]> = {
+        nursery: ["nursery%"],
+        kindergarten_i: ["kg i%", "kg_i%", "kindergarten i%", "kindergarten_i%"],
+        kindergarten_ii: ["kg ii%", "kg_ii%", "kindergarten ii%", "kindergarten_ii%"],
+        kindergarten_iii: ["kg iii%", "kg_iii%", "kindergarten iii%", "kindergarten_iii%"],
+        standard_i: ["standard i%", "standard_i%", "class i%", "class_i%"],
+        standard_ii: ["standard ii%", "standard_ii%", "class ii%", "class_ii%"],
+        standard_iii: ["standard iii%", "standard_iii%", "class iii%", "class_iii%"],
+        standard_iv: ["standard iv%", "standard_iv%", "class iv%", "class_iv%"],
+        standard_v: ["standard v%", "standard_v%", "class v%", "class_v%"],
+        standard_vi: ["standard vi%", "standard_vi%", "class vi%", "class_vi%"],
+        form_i: ["form i%", "form_i%"], form_ii: ["form ii%", "form_ii%"],
+        form_iii: ["form iii%", "form_iii%"], form_iv: ["form iv%", "form_iv%"],
+    };
+    return patterns[stage] ? or(...patterns[stage].map((pattern) => ilike(classes.name, pattern))) : null;
+}
+
+function dashboardSchoolScope(value: unknown, role?: string) {
+    if (role !== "super_admin" || value === undefined) return undefined;
+    const level = String(value);
+    if (!["primary", "secondary"].includes(level)) return null;
+    return eq(classes.schoolLevel, level as "primary" | "secondary");
+}
+
 // A teacher's dashboard is scoped to only the classes they teach — their own
 // students, attendance, and grading load, not the whole school's. Every other
 // role still sees the org-wide numbers.
 dashboardRouter.get("/stats", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId));
         const isTeacher = req.user?.role === "teacher";
         const contextClassIds = req.user?.id && (req.user.role === "teacher" || req.user.role === "student")
             ? await activePortalClassIds({ ...req.user, id: req.user.id })
@@ -62,12 +100,12 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     .select({ total: countDistinct(enrollments.studentId) })
                     .from(enrollments)
                     .innerJoin(classes, eq(enrollments.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
-                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope)),
+                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope)),
                 db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(classes)
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope)),
                 db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -75,19 +113,19 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     })
                     .from(attendance)
                     .innerJoin(classes, eq(attendance.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, gte(attendance.date, cutoff30))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope, gte(attendance.date, cutoff30))),
                 db
                     .select({ total: count() })
                     .from(submissions)
                     .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                     .innerJoin(classes, eq(assignments.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, eq(submissions.status, "submitted"))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope, eq(submissions.status, "submitted"))),
                 // Prior-period baselines for trend deltas — same shape, cut off 30 days earlier.
-                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope, lt(classes.createdAt, daysAgo(30)))),
+                db.select({ total: count() }).from(classes).where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope, lt(classes.createdAt, daysAgo(30)))),
                 db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(classes)
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, lt(classes.createdAt, daysAgo(30)))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope, lt(classes.createdAt, daysAgo(30)))),
                 db
                     .select({
                         total: sql<number>`count(*)`.mapWith(Number),
@@ -95,20 +133,20 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                     })
                     .from(attendance)
                     .innerJoin(classes, eq(attendance.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope, gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
                 // Assignment completion = actual submissions / (assignments × enrolled students) across the teacher's classes.
                 db
                     .select({ total: sql<number>`count(*)`.mapWith(Number) })
                     .from(assignments)
                     .innerJoin(classes, eq(assignments.classId, classes.id))
                     .innerJoin(enrollments, eq(enrollments.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope)),
                 db
                     .select({ total: count() })
                     .from(submissions)
                     .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                     .innerJoin(classes, eq(assignments.classId, classes.id))
-                    .where(and(eq(classes.teacherId, teacherId), contextClassScope)),
+                    .where(and(eq(classes.teacherId, teacherId), contextClassScope, dashboardClassScope)),
             ]);
 
             const attendanceRate = attendanceStats && attendanceStats.total > 0
@@ -146,7 +184,8 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
         // through this branch too, but the root dashboard doesn't use these
         // org-wide numbers for them — see /profile/my-children instead.
         const isStudent = req.user?.role === "student";
-        const isAdminLike = req.user?.role === "admin" || req.user?.role === "super_admin";
+        const isAdminLike = policy.isAdmin(req.user!);
+        const isHeadmaster = policy.isHeadmaster(req.user!);
         const studentId = req.user?.id;
         const cutoff30 = daysAgoISO(30);
         const cutoff60 = daysAgoISO(60);
@@ -160,18 +199,24 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
         ] = await Promise.all([
             isStudent && studentId
                 ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(and(eq(enrollments.studentId, studentId), contextClassIds ? inArray(enrollments.classId, contextClassIds) : undefined))
-                : db.select({ total: count() }).from(user).where(eq(user.role, "student")),
-            db.select({ total: count() }).from(user).where(eq(user.role, "teacher")),
+                : isHeadmaster || academicYearId !== undefined
+                    ? db.select({ total: countDistinct(enrollments.studentId) }).from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).where(dashboardClassScope)
+                    : db.select({ total: count() }).from(user).where(eq(user.role, "student")),
+            isHeadmaster || academicYearId !== undefined
+                ? db.select({ total: countDistinct(classes.teacherId) }).from(classes).where(dashboardClassScope)
+                : db.select({ total: count() }).from(user).where(eq(user.role, "teacher")),
             isStudent && studentId
                 ? db.select({ total: countDistinct(enrollments.classId) }).from(enrollments).where(and(eq(enrollments.studentId, studentId), contextClassIds ? inArray(enrollments.classId, contextClassIds) : undefined))
-                : db.select({ total: count() }).from(classes),
+                : db.select({ total: count() }).from(classes).where(dashboardClassScope),
             isStudent && studentId
                 ? db
                     .select({ total: countDistinct(classes.subjectId) })
                     .from(enrollments)
                     .innerJoin(classes, eq(enrollments.classId, classes.id))
                     .where(and(eq(enrollments.studentId, studentId), contextClassScope))
-                : db.select({ total: count() }).from(subjects),
+                : isHeadmaster || academicYearId !== undefined
+                    ? db.select({ total: countDistinct(classes.subjectId) }).from(classes).where(dashboardClassScope)
+                    : db.select({ total: count() }).from(subjects),
             isStudent && studentId
                 ? db
                     .select({
@@ -186,18 +231,28 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                         present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
                     })
                     .from(attendance)
-                    .where(gte(attendance.date, cutoff30)),
-            db
-                .select({ total: count() })
-                .from(submissions)
-                .where(eq(submissions.status, "submitted")),
+                    .innerJoin(classes, eq(attendance.classId, classes.id))
+                    .where(and(gte(attendance.date, cutoff30), dashboardClassScope)),
+            isHeadmaster || academicYearId !== undefined
+                ? db
+                    .select({ total: count() })
+                    .from(submissions)
+                    .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
+                    .innerJoin(classes, eq(assignments.classId, classes.id))
+                    .where(and(eq(submissions.status, "submitted"), dashboardClassScope))
+                : db
+                    .select({ total: count() })
+                    .from(submissions)
+                    .where(eq(submissions.status, "submitted")),
             // Prior-period baselines for trend deltas. Students' own
             // enrollment counts have no createdAt to compare against, so
             // those trends are simply omitted below rather than computed here.
             db.select({ total: count() }).from(user).where(and(eq(user.role, "student"), lt(user.createdAt, cutoff30Date))),
             db.select({ total: count() }).from(user).where(and(eq(user.role, "teacher"), lt(user.createdAt, cutoff30Date))),
-            db.select({ total: count() }).from(classes).where(lt(classes.createdAt, cutoff30Date)),
-            db.select({ total: count() }).from(subjects).where(lt(subjects.createdAt, cutoff30Date)),
+            db.select({ total: count() }).from(classes).where(and(dashboardClassScope, lt(classes.createdAt, cutoff30Date))),
+            academicYearId !== undefined
+                ? db.select({ total: countDistinct(classes.subjectId) }).from(classes).where(and(dashboardClassScope, lt(classes.createdAt, cutoff30Date)))
+                : db.select({ total: count() }).from(subjects).where(lt(subjects.createdAt, cutoff30Date)),
             isStudent && studentId
                 ? db
                     .select({
@@ -212,9 +267,14 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
                         present: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
                     })
                     .from(attendance)
-                    .where(and(gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
-            isAdminLike ? db.select({ total: count() }).from(departments) : Promise.resolve([{ total: 0 }]),
-            isAdminLike ? db.select({ total: count() }).from(departments).where(lt(departments.createdAt, cutoff30Date)) : Promise.resolve([{ total: 0 }]),
+                    .innerJoin(classes, eq(attendance.classId, classes.id))
+                    .where(and(dashboardClassScope, gte(attendance.date, cutoff60), lt(attendance.date, cutoff30))),
+            isAdminLike && (isHeadmaster || academicYearId !== undefined)
+                ? db.select({ total: countDistinct(departments.id) }).from(departments).innerJoin(subjects, eq(subjects.departmentId, departments.id)).innerJoin(classes, eq(classes.subjectId, subjects.id)).where(dashboardClassScope)
+                : isAdminLike ? db.select({ total: count() }).from(departments) : Promise.resolve([{ total: 0 }]),
+            isAdminLike && (isHeadmaster || academicYearId !== undefined)
+                ? db.select({ total: countDistinct(departments.id) }).from(departments).innerJoin(subjects, eq(subjects.departmentId, departments.id)).innerJoin(classes, eq(classes.subjectId, subjects.id)).where(and(dashboardClassScope, lt(departments.createdAt, cutoff30Date)))
+                : isAdminLike ? db.select({ total: count() }).from(departments).where(lt(departments.createdAt, cutoff30Date)) : Promise.resolve([{ total: 0 }]),
             isStudent && studentId
                 ? db
                     .select({ total: sql<number>`count(*)`.mapWith(Number) })
@@ -278,6 +338,9 @@ dashboardRouter.get("/stats", requireAuth, async (req, res) => {
 // for the latest 5; the "all activity" page asks for a larger slice.
 dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId));
         const requestedLimit = Number(req.query.limit);
         const limit = Number.isFinite(requestedLimit)
             ? Math.min(Math.max(Math.trunc(requestedLimit), 1), 100)
@@ -286,6 +349,11 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
             ? await activePortalClassIds({ ...req.user, id: req.user.id })
             : null;
         const activityScope = contextClassIds ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`) : undefined;
+        const announcementScope = contextClassIds
+            ? and(activityScope, dashboardClassScope)
+            : dashboardClassScope
+                ? or(isNull(announcements.classId), dashboardClassScope)!
+                : undefined;
 
         const [recentAnnouncements, recentAssignments, recentSubmissions] = await Promise.all([
             db
@@ -297,6 +365,8 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 })
                 .from(announcements)
                 .innerJoin(user, eq(announcements.authorId, user.id))
+                .leftJoin(classes, eq(announcements.classId, classes.id))
+                .where(announcementScope)
                 .orderBy(desc(announcements.createdAt))
                 .limit(limit),
             db
@@ -308,7 +378,7 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 })
                 .from(assignments)
                 .innerJoin(classes, eq(assignments.classId, classes.id))
-                .where(activityScope)
+                .where(and(activityScope, dashboardClassScope))
                 .orderBy(desc(assignments.createdAt))
                 .limit(limit),
             db
@@ -322,7 +392,11 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
                 .innerJoin(user, eq(submissions.studentId, user.id))
                 .innerJoin(assignments, eq(submissions.assignmentId, assignments.id))
                 .innerJoin(classes, eq(assignments.classId, classes.id))
-                .where(activityScope)
+                .where(and(
+                    activityScope,
+                    dashboardClassScope,
+                    policy.isTeacher(req.user!) ? eq(user.role, "student") : undefined,
+                ))
                 .orderBy(desc(submissions.submittedAt))
                 .limit(limit),
         ]);
@@ -366,6 +440,9 @@ dashboardRouter.get("/recent-activity", requireAuth, async (req, res) => {
 // students see their own records, and administrators see the school total.
 dashboardRouter.get("/attendance-today", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId));
         const today = new Date().toISOString().slice(0, 10);
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
@@ -377,10 +454,10 @@ dashboardRouter.get("/attendance-today", requireAuth, async (req, res) => {
             ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
             : undefined;
         const scope = isTeacher && userId
-            ? and(eq(classes.teacherId, userId), contextClassScope)
+            ? and(eq(classes.teacherId, userId), contextClassScope, dashboardClassScope)
             : isStudent && userId
-                ? and(eq(attendance.studentId, userId), contextClassScope)
-                : undefined;
+                ? and(eq(attendance.studentId, userId), contextClassScope, dashboardClassScope)
+                : dashboardClassScope;
 
         const [summary] = await db
             .select({
@@ -400,11 +477,11 @@ dashboardRouter.get("/attendance-today", requireAuth, async (req, res) => {
         let unrecordedClasses: { id: number; name: string }[] = [];
         if (isTeacher && userId) {
             const [myClasses, recorded] = await Promise.all([
-                db.select({ id: classes.id, name: classes.name }).from(classes).where(and(eq(classes.teacherId, userId), contextClassScope)),
+                db.select({ id: classes.id, name: classes.name }).from(classes).where(and(eq(classes.teacherId, userId), contextClassScope, dashboardClassScope)),
                 db.select({ classId: attendance.classId })
                     .from(attendance)
                     .innerJoin(classes, eq(attendance.classId, classes.id))
-                    .where(and(eq(attendance.date, today), eq(classes.teacherId, userId), contextClassScope))
+                    .where(and(eq(attendance.date, today), eq(classes.teacherId, userId), contextClassScope, dashboardClassScope))
                     .groupBy(attendance.classId),
             ]);
             const recordedIds = new Set(recorded.map((row) => row.classId));
@@ -434,6 +511,13 @@ const ATTENDANCE_RANGE_DAYS: Record<string, number> = { "7": 7, "30": 30, "90": 
 
 dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const stageScope = dashboardStageScope(req.query.stage);
+        if (stageScope === null) return res.status(400).json({ message: "Invalid class or form" });
+        const schoolScope = dashboardSchoolScope(req.query.schoolLevel, req.user?.role);
+        if (schoolScope === null) return res.status(400).json({ message: "Invalid school level" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId), schoolScope, stageScope);
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
@@ -455,6 +539,7 @@ dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
         if (isTeacher && userId) conditions.push(eq(classes.teacherId, userId));
         if (isStudent && userId) conditions.push(eq(attendance.studentId, userId));
         if (contextClassScope) conditions.push(contextClassScope);
+        if (dashboardClassScope) conditions.push(dashboardClassScope);
 
         const rows = await db
             .select({
@@ -485,12 +570,18 @@ dashboardRouter.get("/attendance-trend", requireAuth, async (req, res) => {
     }
 });
 
-// GET /api/dashboard/grade-distribution — count of (students | the caller's own
-// classes) per letter grade. Scoped to the teacher's own classes for teachers,
-// to the student's own grades for students ("Student Performance" on their
-// dashboard, not the whole class's); org-wide for everyone else.
+// GET /api/dashboard/grade-distribution — count of students or personal subjects
+// per letter grade. Personal bars count each subject; staff bars count each
+// student after averaging published Midterm and Terminal subject averages.
 dashboardRouter.get("/grade-distribution", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const stageScope = dashboardStageScope(req.query.stage);
+        if (stageScope === null) return res.status(400).json({ message: "Invalid class or form" });
+        const schoolScope = dashboardSchoolScope(req.query.schoolLevel, req.user?.role);
+        if (schoolScope === null) return res.status(400).json({ message: "Invalid school level" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId), schoolScope, stageScope);
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
@@ -500,28 +591,142 @@ dashboardRouter.get("/grade-distribution", requireAuth, async (req, res) => {
         const contextClassScope = contextClassIds
             ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
             : undefined;
-        const scopeClause = isTeacher && userId
-            ? and(eq(classes.teacherId, userId), contextClassScope)
-            : isStudent && userId
-                ? and(eq(classGrades.studentId, userId), contextClassScope)
-                : undefined;
+        if (isStudent && userId) {
+            const counts: Record<string, number> = { A: 0, B: 0, C: 0, D: 0, F: 0 };
+            // A subject is counted once, after averaging its published Midterm
+            // and Terminal marks for this portal year. Incomplete pairs are
+            // deliberately omitted so the chart never presents a partial-year
+            // score as a final subject grade.
+            if (!contextClassIds?.length) {
+                return res.json({ data: Object.entries(counts).map(([grade, count]) => ({ grade, count })) });
+            }
+            const resultRows = await db
+                .select({ subjectId: termSubjectResults.subjectId, termType: academicTerms.type, score: termSubjectResults.score })
+                .from(termSubjectResults)
+                .innerJoin(classes, eq(termSubjectResults.classId, classes.id))
+                .innerJoin(academicTerms, eq(termSubjectResults.academicTermId, academicTerms.id))
+                .where(and(
+                    eq(termSubjectResults.studentId, userId),
+                    inArray(classes.id, contextClassIds),
+                    eq(termSubjectResults.published, true),
+                    eq(termSubjectResults.applicable, true),
+                    academicYearId === undefined ? undefined : eq(academicTerms.academicYearId, academicYearId),
+                ));
 
-        const rows = await db
-            .select({ letterGrade: classGrades.letterGrade, total: sql<number>`count(*)`.mapWith(Number) })
-            .from(classGrades)
-            .innerJoin(classes, eq(classGrades.classId, classes.id))
-            .where(scopeClause)
-            .groupBy(classGrades.letterGrade);
+            const bySubject = new Map<number, { midterm: number[]; terminal: number[] }>();
+            for (const row of resultRows) {
+                const results = bySubject.get(row.subjectId) ?? { midterm: [], terminal: [] };
+                results[row.termType].push(Number(row.score));
+                bySubject.set(row.subjectId, results);
+            }
+            for (const results of bySubject.values()) {
+                if (results.midterm.length === 0 || results.terminal.length === 0) continue;
+                const midtermAverage = results.midterm.reduce((sum, score) => sum + score, 0) / results.midterm.length;
+                const terminalAverage = results.terminal.reduce((sum, score) => sum + score, 0) / results.terminal.length;
+                const subjectAverage = (midtermAverage + terminalAverage) / 2;
+                const grade = gradeSecondaryScore(subjectAverage).grade;
+                counts[grade] = (counts[grade] ?? 0) + 1;
+            }
+            return res.json({ data: Object.entries(counts).map(([grade, count]) => ({ grade, count })) });
+        }
 
         const counts: Record<string, number> = { A: 0, B: 0, C: 0, D: 0, F: 0 };
-        for (const r of rows) {
-            if (r.letterGrade && r.letterGrade in counts) counts[r.letterGrade] = r.total;
+        const resultRows = await db
+            .select({ studentId: termSubjectResults.studentId, subjectId: termSubjectResults.subjectId, termType: academicTerms.type, score: termSubjectResults.score })
+            .from(termSubjectResults)
+            .innerJoin(classes, eq(termSubjectResults.classId, classes.id))
+            .innerJoin(academicTerms, eq(termSubjectResults.academicTermId, academicTerms.id))
+            .where(and(
+                eq(termSubjectResults.published, true),
+                eq(termSubjectResults.applicable, true),
+                eq(academicTerms.academicYearId, classes.academicYearId),
+                dashboardClassScope,
+                isTeacher && userId ? eq(classes.teacherId, userId) : undefined,
+                contextClassScope,
+            ));
+
+        // Count each student once: average their applicable subject scores
+        // within Midterm and Terminal, then average those two term averages.
+        const byStudent = new Map<string, { midterm: Map<number, number[]>; terminal: Map<number, number[]> }>();
+        for (const row of resultRows) {
+            const results = byStudent.get(row.studentId) ?? { midterm: new Map<number, number[]>(), terminal: new Map<number, number[]>() };
+            const bySubject = results[row.termType];
+            bySubject.set(row.subjectId, [...(bySubject.get(row.subjectId) ?? []), Number(row.score)]);
+            byStudent.set(row.studentId, results);
+        }
+        for (const results of byStudent.values()) {
+            if (results.midterm.size === 0 || results.terminal.size === 0) continue;
+            const termAverage = (scoresBySubject: Map<number, number[]>) => {
+                const subjectAverages = [...scoresBySubject.values()].map((scores) => scores.reduce((sum, score) => sum + score, 0) / scores.length);
+                return subjectAverages.reduce((sum, score) => sum + score, 0) / subjectAverages.length;
+            };
+            const finalAverage = (termAverage(results.midterm) + termAverage(results.terminal)) / 2;
+            const grade = gradeSecondaryScore(finalAverage).grade;
+            counts[grade] = (counts[grade] ?? 0) + 1;
         }
 
         res.json({ data: Object.entries(counts).map(([grade, count]) => ({ grade, count })) });
     } catch (error) {
         console.error("Dashboard grade-distribution error:", error);
         res.status(500).json({ message: "Failed to load grade distribution" });
+    }
+});
+
+// GET /api/dashboard/subject-performance ? average final grade by subject.
+// Teachers only receive subjects from their own classes; administrators receive
+// the school-wide view. This powers the subject lists on their dashboards.
+dashboardRouter.get("/subject-performance", requireAuth, async (req, res) => {
+    try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const stageScope = dashboardStageScope(req.query.stage);
+        if (stageScope === null) return res.status(400).json({ message: "Invalid class or form" });
+        const schoolScope = dashboardSchoolScope(req.query.schoolLevel, req.user?.role);
+        if (schoolScope === null) return res.status(400).json({ message: "Invalid school level" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId), schoolScope, stageScope);
+        const isTeacher = req.user?.role === "teacher";
+        const userId = req.user?.id;
+        const contextClassIds = userId && isTeacher
+            ? await activePortalClassIds({ ...req.user!, id: userId })
+            : null;
+        const contextClassScope = contextClassIds
+            ? (contextClassIds.length ? inArray(classes.id, contextClassIds) : sql`false`)
+            : undefined;
+        const scopeClause = isTeacher && userId
+            ? and(eq(classes.teacherId, userId), contextClassScope, dashboardClassScope)
+            : dashboardClassScope;
+
+        const rows = await db
+            .select({
+                subjectId: subjects.id,
+                subjectName: subjects.name,
+                avgGrade: sql<number | null>`avg(${termSubjectResults.score})`,
+                passedCount: sql<number>`count(*) filter (where ${termSubjectResults.score} >= 45)`.mapWith(Number),
+                needsAttentionCount: sql<number>`count(*) filter (where ${termSubjectResults.score} < 30)`.mapWith(Number),
+                topGradeCount: sql<number>`count(*) filter (where ${termSubjectResults.score} >= 75)`.mapWith(Number),
+                failingCount: sql<number>`count(*) filter (where ${termSubjectResults.score} < 30)`.mapWith(Number),
+            })
+            .from(termSubjectResults)
+            .innerJoin(classes, eq(termSubjectResults.classId, classes.id))
+            .innerJoin(subjects, eq(classes.subjectId, subjects.id))
+            .innerJoin(academicTerms, eq(termSubjectResults.academicTermId, academicTerms.id))
+            .where(and(scopeClause, eq(termSubjectResults.published, true), academicYearId === undefined ? undefined : eq(academicTerms.academicYearId, academicYearId)))
+            .groupBy(subjects.id, subjects.name);
+
+        res.json({
+            data: rows.map((row) => ({
+                subjectId: row.subjectId,
+                subjectName: row.subjectName,
+                avgGrade: row.avgGrade === null ? null : Math.round(Number(row.avgGrade) * 10) / 10,
+                passedCount: row.passedCount,
+                needsAttentionCount: row.needsAttentionCount,
+                topGradeCount: row.topGradeCount,
+                failingCount: row.failingCount,
+            })),
+        });
+    } catch (error) {
+        console.error("Dashboard subject-performance error:", error);
+        res.status(500).json({ message: "Failed to load subject performance" });
     }
 });
 
@@ -533,6 +738,13 @@ dashboardRouter.get("/grade-distribution", requireAuth, async (req, res) => {
 // performing classes list — one query set, no duplicated aggregation.
 dashboardRouter.get("/class-activity", requireAuth, async (req, res) => {
     try {
+        const academicYearId = readAcademicYearId(req.query.academicYearId);
+        if (academicYearId === null) return res.status(400).json({ message: "Invalid academic year" });
+        const stageScope = dashboardStageScope(req.query.stage);
+        if (stageScope === null) return res.status(400).json({ message: "Invalid class or form" });
+        const schoolScope = dashboardSchoolScope(req.query.schoolLevel, req.user?.role);
+        if (schoolScope === null) return res.status(400).json({ message: "Invalid school level" });
+        const dashboardClassScope = and(policy.headmasterClassScope(req.user!), academicYearId === undefined ? undefined : eq(classes.academicYearId, academicYearId), schoolScope, stageScope);
         const isTeacher = req.user?.role === "teacher";
         const isStudent = req.user?.role === "student";
         const userId = req.user?.id;
@@ -547,12 +759,14 @@ dashboardRouter.get("/class-activity", requireAuth, async (req, res) => {
 
         let scopeClause;
         if (isTeacher && userId) {
-            scopeClause = and(eq(classes.teacherId, userId), contextClassScope);
+            scopeClause = and(eq(classes.teacherId, userId), contextClassScope, dashboardClassScope);
         } else if (isStudent && userId) {
             const enrolled = await db.select({ classId: enrollments.classId }).from(enrollments).where(eq(enrollments.studentId, userId));
             const classIds = enrolled.map((r) => r.classId);
             if (classIds.length === 0) return res.json({ data: [] });
-            scopeClause = and(inArray(classes.id, classIds), contextClassScope);
+            scopeClause = and(inArray(classes.id, classIds), contextClassScope, dashboardClassScope);
+        } else if (dashboardClassScope) {
+            scopeClause = dashboardClassScope;
         }
 
         const [assignmentCounts, submissionCounts, attendanceCounts, gradeAverages, classRows] = await Promise.all([
@@ -582,13 +796,14 @@ dashboardRouter.get("/class-activity", requireAuth, async (req, res) => {
                 .where(scopeClause)
                 .groupBy(classGrades.classId),
             db
-                .select({ id: classes.id, name: classes.name })
+                .select({ id: classes.id, name: classes.name, subjectName: subjects.name })
                 .from(classes)
+                .leftJoin(subjects, eq(classes.subjectId, subjects.id))
                 .where(scopeClause),
         ]);
 
-        const byId = new Map<number, { classId: number; className: string; assignments: number; submissions: number; attendanceMarks: number; avgGrade: number | null }>();
-        for (const c of classRows) byId.set(c.id, { classId: c.id, className: c.name, assignments: 0, submissions: 0, attendanceMarks: 0, avgGrade: null });
+        const byId = new Map<number, { classId: number; className: string; subjectName: string | null; assignments: number; submissions: number; attendanceMarks: number; avgGrade: number | null }>();
+        for (const c of classRows) byId.set(c.id, { classId: c.id, className: c.name, subjectName: c.subjectName, assignments: 0, submissions: 0, attendanceMarks: 0, avgGrade: null });
         for (const r of assignmentCounts) { const e = byId.get(r.classId); if (e) e.assignments = r.total; }
         for (const r of submissionCounts) { const e = byId.get(r.classId); if (e) e.submissions = r.total; }
         for (const r of attendanceCounts) { const e = byId.get(r.classId); if (e) e.attendanceMarks = r.total; }

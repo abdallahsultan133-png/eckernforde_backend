@@ -2,7 +2,7 @@ import express from "express";
 import { and, desc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
-import { attendance, classes, enrollments, qrSessions, subjects } from "../db/schema/app.js";
+import { academicYears, attendance, classes, enrollments, qrSessions, subjects } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
 import { requireAuth, requireRole, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
@@ -28,10 +28,10 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
         if (!DATE_RE.test(date)) return res.status(400).json({ error: "date query param must be YYYY-MM-DD" });
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only view rosters for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only view rosters for classes in your school.");
         }
-        if (req.user!.id && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, classId))) {
+        if (req.user!.id && policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id }, classId))) {
             return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
@@ -55,7 +55,7 @@ router.get("/class/:classId", requireAuth, async (req, res) => {
                     eq(attendance.date, date)
                 )
             )
-            .where(eq(enrollments.classId, classId))
+            .where(and(eq(enrollments.classId, classId), policy.isTeacher(req.user!) ? eq(user.role, "student") : undefined))
             .orderBy(user.name);
 
         res.status(200).json({ data: roster, date, classId });
@@ -76,8 +76,8 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(markAtte
             records: Array<{ studentId: string; status: "present" | "absent" | "late" | "excused"; notes?: string | null }>;
         };
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only mark attendance for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only mark attendance for classes in your school.");
         }
         if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
             return policy.forbidden(res, "This class is outside your selected portal context.");
@@ -124,12 +124,11 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
         const classId = Number(req.params.classId);
         if (!Number.isFinite(classId)) return res.status(400).json({ error: "Invalid class id" });
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only view reports for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only view reports for classes in your school.");
         }
-
-        if (policy.isStudent(req.user!) && !(await policy.isEnrolledInClass(req.user!.id!, classId))) {
-            return policy.forbidden(res, "You're not enrolled in this class.");
+        if ((policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         let childIds: string[] = [];
@@ -150,21 +149,31 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
             : policy.isParent(req.user!) ? and(eq(enrollments.classId, classId), inArray(enrollments.studentId, childIds))
             : eq(enrollments.classId, classId);
 
+        const [period] = await db
+            .select({
+                firstDate: sql<string | null>`min(${attendance.date})`,
+                lastDate: sql<string | null>`max(${attendance.date})`,
+            })
+            .from(enrollments)
+            .innerJoin(user, eq(enrollments.studentId, user.id))
+            .leftJoin(attendance, and(eq(attendance.studentId, enrollments.studentId), ...conditions))
+            .where(and(rosterScope, eq(user.role, "student")));
+
         const rows = await db
             .select({
                 studentId: user.id,
                 name: user.name,
                 email: user.email,
-                totalMarked: sql<number>`count(${attendance.id})`,
-                presentCount: sql<number>`count(*) filter (where ${attendance.status} = 'present')`,
-                absentCount: sql<number>`count(*) filter (where ${attendance.status} = 'absent')`,
-                lateCount: sql<number>`count(*) filter (where ${attendance.status} = 'late')`,
-                excusedCount: sql<number>`count(*) filter (where ${attendance.status} = 'excused')`,
+                totalMarked: sql<number>`count(${attendance.id})`.mapWith(Number),
+                presentCount: sql<number>`count(*) filter (where ${attendance.status} = 'present')`.mapWith(Number),
+                absentCount: sql<number>`count(*) filter (where ${attendance.status} = 'absent')`.mapWith(Number),
+                lateCount: sql<number>`count(*) filter (where ${attendance.status} = 'late')`.mapWith(Number),
+                excusedCount: sql<number>`count(*) filter (where ${attendance.status} = 'excused')`.mapWith(Number),
             })
             .from(enrollments)
             .innerJoin(user, eq(enrollments.studentId, user.id))
             .leftJoin(attendance, and(eq(attendance.studentId, enrollments.studentId), ...conditions))
-            .where(rosterScope)
+            .where(and(rosterScope, eq(user.role, "student")))
             .groupBy(user.id, user.name, user.email)
             .orderBy(user.name);
 
@@ -173,7 +182,13 @@ router.get("/class/:classId/report", requireAuth, async (req, res) => {
             attendanceRate: row.totalMarked > 0 ? Math.round((row.presentCount / row.totalMarked) * 1000) / 10 : null,
         }));
 
-        res.status(200).json({ data });
+        res.status(200).json({
+            data,
+            period: {
+                firstDate: period?.firstDate ?? null,
+                lastDate: period?.lastDate ?? null,
+            },
+        });
     } catch (e) {
         console.error("GET /attendance/class/:classId/report error:", e);
         res.status(500).json({ error: "Failed to load attendance report" });
@@ -190,10 +205,22 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
         if (!(await policy.canAccessStudent(req.user!, studentId))) return policy.forbidden(res);
 
         const classId = req.query.classId ? Number(req.query.classId) : undefined;
-        const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? "30"), 10) || 30), 200);
+        if (classId && Number.isFinite(classId) && (policy.isTeacher(req.user!) || policy.isStudent(req.user!)) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
+        }
+        const yearId = req.query.academicYearId === undefined ? null : Number(req.query.academicYearId);
+        if (yearId !== null && (!Number.isInteger(yearId) || yearId <= 0)) return res.status(400).json({ error: "Invalid academic year" });
+        const [year] = yearId === null ? [] : await db.select().from(academicYears).where(eq(academicYears.id, yearId));
+        if (yearId !== null && !year) return res.status(404).json({ error: "Academic year not found" });
+        const limit = Math.min(Math.max(1, parseInt(String(req.query.limit ?? "30"), 10) || 30), 2000);
 
         const conditions = [eq(attendance.studentId, studentId)];
         if (classId && Number.isFinite(classId)) conditions.push(eq(attendance.classId, classId));
+        if (year) {
+            conditions.push(eq(classes.academicYearId, year.id));
+            conditions.push(gte(attendance.date, year.startsOn));
+            conditions.push(lte(attendance.date, year.endsOn));
+        }
 
         const history = await db
             .select({
@@ -227,8 +254,11 @@ router.post("/qr/generate", requireAuth, requireRole(...STAFF_ROLES), validateBo
             classId: number; date: string; expiryMinutes?: number;
         };
 
-        if (policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only generate QR sessions for classes you teach.");
+        if ((policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only generate QR sessions for classes in your school.");
+        }
+        if (policy.isTeacher(req.user!) && !(await isInActivePortalClass({ ...req.user!, id: req.user!.id! }, classId))) {
+            return policy.forbidden(res, "This class is outside your selected portal context.");
         }
 
         const token = crypto.randomBytes(24).toString("hex");

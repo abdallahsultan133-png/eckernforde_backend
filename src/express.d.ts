@@ -6,6 +6,11 @@ declare global {
                 name?: string;
                 email?: string;
                 role?: UserRoles;
+                portalArchive?: {
+                    academicYearId: number;
+                    schoolBand: "primary" | "secondary";
+                    stage: string;
+                };
             };
         }
     }

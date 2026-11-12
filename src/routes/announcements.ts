@@ -1,5 +1,5 @@
 import express from "express";
-import { and, desc, eq, getTableColumns, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, getTableColumns, inArray, isNull, or, sql } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { announcements, classes, enrollments } from "../db/schema/app.js";
@@ -9,6 +9,7 @@ import { validateBody } from "../middleware/validate.js";
 import { createAnnouncementSchema, updateAnnouncementSchema } from "../lib/schemas.js";
 import { notifyEnrolledStudents } from "./notifications.js";
 import { sendAnnouncementEmail } from "../lib/email.js";
+import { classNotificationRecipients, filterNotificationRecipients } from "../lib/user-notification-preferences.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
 import { activePortalClassIds } from "../lib/portal-context.js";
@@ -47,7 +48,7 @@ router.get("/", requireAuth, async (req, res) => {
 
         let visibilityClause;
 
-        if (req.user?.role === "student") {
+        if (req.user?.role === "student" && !classId) {
             const myClasses = await db
                 .select({ classId: enrollments.classId })
                 .from(enrollments)
@@ -71,12 +72,23 @@ router.get("/", requireAuth, async (req, res) => {
                 : isNull(announcements.classId);
         }
 
+        if (policy.isHeadmaster(req.user!)) {
+            const myClasses = await db
+                .select({ classId: classes.id })
+                .from(classes)
+                .where(eq(classes.schoolLevel, policy.headmasterSchoolLevel(req.user!)!));
+            const classIds = myClasses.map((c) => c.classId);
+            visibilityClause = classIds.length > 0
+                ? or(isNull(announcements.classId), inArray(announcements.classId, classIds))
+                : isNull(announcements.classId);
+        }
+
         if (req.user?.id && (policy.isTeacher(req.user) || policy.isStudent(req.user))) {
             const selectedClassIds = await activePortalClassIds({ ...req.user, id: req.user.id });
-            if (selectedClassIds) {
+            if (selectedClassIds !== null) {
                 visibilityClause = selectedClassIds.length
-                    ? or(isNull(announcements.classId), inArray(announcements.classId, selectedClassIds))
-                    : isNull(announcements.classId);
+                    ? inArray(announcements.classId, selectedClassIds)
+                    : sql`false`;
             }
         }
 
@@ -115,8 +127,8 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAn
             pinned?: boolean;
         };
 
-        if (classId && policy.isTeacher(req.user!) && !(await policy.canManageClass(req.user!, classId))) {
-            return policy.forbidden(res, "You can only post announcements for classes you teach.");
+        if (classId && (policy.isTeacher(req.user!) || policy.isHeadmaster(req.user!)) && !(await policy.canManageClass(req.user!, classId))) {
+            return policy.forbidden(res, "You can only post announcements for classes in your school.");
         }
 
         const [created] = await db
@@ -144,11 +156,9 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createAn
             });
 
             // Send email to enrolled students
-            const enrolled = await db.select({ email: user.email })
-                .from(enrollments)
-                .innerJoin(user, eq(enrollments.studentId, user.id))
-                .where(eq(enrollments.classId, classId));
-            const emails = enrolled.map((e) => e.email).filter(Boolean) as string[];
+            const enrolled = await classNotificationRecipients(classId);
+            const emailEnabledIds = new Set(await filterNotificationRecipients(enrolled.map((recipient) => recipient.id), "email"));
+            const emails = enrolled.filter((recipient) => emailEnabledIds.has(recipient.id)).map((recipient) => recipient.email).filter(Boolean) as string[];
             if (emails.length > 0) {
                 const [cls] = await db.select({ name: classes.name }).from(classes).where(eq(classes.id, classId));
                 const [author] = await db.select({ name: user.name }).from(user).where(eq(user.id, req.user!.id!));
@@ -178,6 +188,9 @@ router.put("/:id", requireAuth, requireRole(...STAFF_ROLES), validateBody(update
 
         const [existing] = await db.select().from(announcements).where(eq(announcements.id, id));
         if (!existing) return res.status(404).json({ error: "Announcement not found" });
+        if (policy.isHeadmaster(req.user!) && existing.classId !== null && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only edit announcements for classes in your school.");
+        }
         if (!policy.ownsOrAdmin(req.user!, existing.authorId)) {
             return policy.forbidden(res, "You can only edit your own announcements.");
         }
@@ -218,6 +231,9 @@ router.patch("/:id/publication", requireAuth, requireRole(...ADMIN_ROLES), async
         if (!Number.isInteger(id) || typeof isPublic !== "boolean") return res.status(400).json({ error: "Valid announcement id and publication status are required." });
         const [existing] = await db.select({ id: announcements.id, classId: announcements.classId }).from(announcements).where(eq(announcements.id, id));
         if (!existing) return res.status(404).json({ error: "Announcement not found" });
+        if (policy.isHeadmaster(req.user!) && existing.classId !== null && !(await policy.canManageClass(req.user!, existing.classId))) {
+            return policy.forbidden(res, "You can only delete announcements for classes in your school.");
+        }
         if (isPublic && existing.classId !== null) return res.status(400).json({ error: "Only school-wide announcements can be published publicly." });
         const [updated] = await db.update(announcements).set({ isPublic }).where(eq(announcements.id, id)).returning();
         await logAction({ req, action: isPublic ? "announcement.publish" : "announcement.unpublish", resource: "announcements", resourceId: id });

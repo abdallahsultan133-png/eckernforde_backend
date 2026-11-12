@@ -113,7 +113,7 @@ describe("submitAssignmentSchema", () => {
 
 describe("updateRoleSchema", () => {
     it("accepts each known role", () => {
-        for (const role of ["student", "teacher", "admin", "parent", "super_admin"]) {
+        for (const role of ["student", "teacher", "primary_headmaster", "secondary_headmaster", "parent", "super_admin"]) {
             expect(updateRoleSchema.safeParse({ role }).success).toBe(true);
         }
     });

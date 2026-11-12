@@ -1,20 +1,22 @@
 /**
  * Email notification service using Brevo (preferred) or Resend.
- * All functions are fire-and-forget (never throw) — email failures
- * should never break the main request flow.
+ * Email failures never throw. Admissions enquiries inspect the return value
+ * so a rejected provider request is visible in server logs.
  *
  * Setup required (Brevo):
- *   1. Add BREVO_API_KEY=xkeysib-... to classroom-backend/.env
- *   2. Add BREVO_FROM_EMAIL=noreply@yourdomain.com and optionally BREVO_FROM_NAME.
- *      (use "Classroom MS <noreply@yourdomain.com>" format for display name)
+ *   1. Add BREVO_API_KEY=xkeysib-... to server/.env.
+ *   2. Add a verified sender as BREVO_FROM_EMAIL=noreply@yourdomain.com
+ *      and optionally BREVO_FROM_NAME.
  *
- * If RESEND_API_KEY is not set, all email functions silently no-op.
+ * If neither BREVO_API_KEY nor RESEND_API_KEY is set, email functions
+ * gracefully no-op and log a configuration warning.
  */
 
 type EmailParams = {
     to: string | string[];
     subject: string;
     html: string;
+    replyTo?: { email: string; name?: string };
 };
 
 const PRODUCT_NAME = process.env.SCHOOL_NAME?.trim() || "Eckernforde Schools";
@@ -85,7 +87,7 @@ const wrap = (content: string) => `
     </div>
 </div>`;
 
-async function sendEmail(params: EmailParams): Promise<void> {
+async function sendEmail(params: EmailParams): Promise<boolean> {
     const brevoKey = process.env.BREVO_API_KEY;
     const brevoFrom = process.env.BREVO_FROM_EMAIL;
     if (brevoKey && brevoFrom) {
@@ -96,15 +98,20 @@ async function sendEmail(params: EmailParams): Promise<void> {
                 body: JSON.stringify({
                     sender: { email: brevoFrom, name: process.env.BREVO_FROM_NAME ?? PRODUCT_NAME },
                     to: (Array.isArray(params.to) ? params.to : [params.to]).map((email) => ({ email })),
+                    ...(params.replyTo ? { replyTo: params.replyTo } : {}),
                     subject: params.subject,
                     htmlContent: params.html,
                 }),
             });
-            if (!res.ok) console.warn("[Email] Brevo error:", await res.json().catch(() => ({})));
+            if (!res.ok) {
+                console.warn("[Email] Brevo rejected the message (status):", res.status);
+                return false;
+            }
+            return true;
         } catch (e) {
             console.warn("[Email] Failed to send via Brevo (non-fatal):", e);
+            return false;
         }
-        return;
     }
 
     const apiKey = process.env.RESEND_API_KEY;
@@ -113,7 +120,7 @@ async function sendEmail(params: EmailParams): Promise<void> {
     if (!apiKey) {
         // Silently skip if not configured — log once so devs know
         console.log("[Email] RESEND_API_KEY not set — skipping email notification.");
-        return;
+        return false;
     }
 
     try {
@@ -126,6 +133,7 @@ async function sendEmail(params: EmailParams): Promise<void> {
             body: JSON.stringify({
                 from,
                 to: Array.isArray(params.to) ? params.to : [params.to],
+                ...(params.replyTo ? { reply_to: params.replyTo.email } : {}),
                 subject: params.subject,
                 html: params.html,
             }),
@@ -134,9 +142,12 @@ async function sendEmail(params: EmailParams): Promise<void> {
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
             console.warn("[Email] Resend error:", err);
+            return false;
         }
+        return true;
     } catch (e) {
         console.warn("[Email] Failed to send email (non-fatal):", e);
+        return false;
     }
 }
 
@@ -147,9 +158,10 @@ export async function sendAdmissionEnquiryEmail(params: {
     phone?: string | null;
     childStage: string;
     message?: string | null;
-}): Promise<void> {
-    await sendEmail({
+}): Promise<boolean> {
+    return sendEmail({
         to: params.to,
+        replyTo: { email: params.email, name: params.fullName },
         subject: `New admissions enquiry from ${params.fullName}`,
         html: wrap(`
             <h2 style="margin:0 0 8px;font-size:18px;">New Admissions Enquiry</h2>
@@ -303,6 +315,33 @@ export async function sendPasswordResetEmail(params: {
     });
 }
 
+export async function sendPasswordResetRequestNotificationEmail(params: {
+    to: string[];
+    requesterName: string;
+    requesterEmail: string;
+    requestedAt: Date;
+    adminUrl: string;
+}): Promise<void> {
+    if (params.to.length === 0) return;
+
+    await sendEmail({
+        to: params.to,
+        subject: `Password recovery request for ${params.requesterEmail}`,
+        html: wrap(`
+            <h2 style="margin:0 0 8px;font-size:18px;">Password Recovery Request</h2>
+            <p style="color:#475569;margin:0 0 16px;">
+                <strong>${escapeHtml(params.requesterName)}</strong> requested help signing in with
+                <strong>${escapeHtml(params.requesterEmail)}</strong>.
+            </p>
+            <p style="color:#64748b;font-size:14px;margin:0 0 16px;">
+                Requested at ${escapeHtml(params.requestedAt.toLocaleString())}. Review the recovery queue
+                to generate a temporary password if needed.
+            </p>
+            <a href="${params.adminUrl}" style="${buttonStyle}">Open Recovery Queue</a>
+        `),
+    });
+}
+
 export async function sendExamReminderEmail(params: {
     to: string[];
     examTitle: string;
@@ -327,6 +366,27 @@ export async function sendExamReminderEmail(params: {
                 <p style="color:#64748b;font-size:14px;">📅 ${params.scheduledAt.toLocaleString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })}</p>
                 ${venueBlock}
             </div>
+        `),
+    });
+}
+
+export async function sendPortalAlertEmail(params: {
+    to: string[];
+    title: string;
+    message: string;
+    link?: string | null;
+}) {
+    if (params.to.length === 0) return;
+    const target = params.link
+        ? `${process.env.FRONTEND_URL ?? ""}${params.link}`
+        : process.env.FRONTEND_URL ?? "";
+    await sendEmail({
+        to: params.to,
+        subject: params.title,
+        html: wrap(`
+            <h2 style="margin:0 0 8px;font-size:18px;">${escapeHtml(params.title)}</h2>
+            <p style="color:#475569;margin:0 0 16px;">${escapeHtml(params.message)}</p>
+            ${target ? `<a href="${escapeHtml(target)}" style="${buttonStyle}">Open Eckernforde Schools</a>` : ""}
         `),
     });
 }

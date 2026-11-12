@@ -1,5 +1,5 @@
 import type { Response } from "express";
-import { and, eq, ilike, inArray, or, type SQL } from "drizzle-orm";
+import { and, eq, ilike, inArray, isNull, or, type SQL } from "drizzle-orm";
 
 import { db } from "../db/index.js";
 import { classes, enrollments, studentProfiles } from "../db/schema/app.js";
@@ -26,15 +26,25 @@ export type Caller = {
     id?: string | undefined;
     role?: UserRoles | undefined;
     email?: string | undefined;
+    portalArchive?: {
+        academicYearId: number;
+        schoolBand: "primary" | "secondary";
+        stage: string;
+    } | undefined;
 };
 
 // ── Role groups ──────────────────────────────────────────────────────────────
 // Defined once; `requireRole(...ADMIN_ROLES)` / `requireRole(...STAFF_ROLES)`
 // replaces the repeated inline tuples across every router.
-export const ADMIN_ROLES = ["admin", "super_admin"] as const satisfies readonly UserRoles[];
-export const STAFF_ROLES = ["teacher", "admin", "super_admin"] as const satisfies readonly UserRoles[];
+export type HeadmasterSchoolLevel = "primary" | "secondary";
 
-export const isAdmin = (c: Caller): boolean => c.role === "admin" || c.role === "super_admin";
+export const ADMIN_ROLES = ["primary_headmaster", "secondary_headmaster", "super_admin"] as const satisfies readonly UserRoles[];
+export const STAFF_ROLES = ["teacher", "primary_headmaster", "secondary_headmaster", "super_admin"] as const satisfies readonly UserRoles[];
+
+export const isHeadmaster = (c: Caller): boolean => c.role === "primary_headmaster" || c.role === "secondary_headmaster";
+export const headmasterSchoolLevel = (c: Caller): HeadmasterSchoolLevel | null =>
+    c.role === "primary_headmaster" ? "primary" : c.role === "secondary_headmaster" ? "secondary" : null;
+export const isAdmin = (c: Caller): boolean => isHeadmaster(c) || c.role === "super_admin";
 export const isStaff = (c: Caller): boolean => c.role === "teacher" || isAdmin(c);
 export const isTeacher = (c: Caller): boolean => c.role === "teacher";
 export const isStudent = (c: Caller): boolean => c.role === "student";
@@ -62,7 +72,7 @@ export const ownsOrAdmin = (caller: Caller, ownerId: string | null | undefined):
  * super_admin may create or demote admin-level accounts.
  */
 export const canGrantRole = (caller: Caller, targetRole: UserRoles): boolean => {
-    if ((targetRole === "admin" || targetRole === "super_admin") && caller.role !== "super_admin") {
+    if ((targetRole === "primary_headmaster" || targetRole === "secondary_headmaster" || targetRole === "super_admin") && caller.role !== "super_admin") {
         return false;
     }
     return isAdmin(caller);
@@ -81,7 +91,7 @@ export const canResetPasswordFor = (
 ): boolean => {
     if (!isAdmin(caller)) return false;
     if (caller.id === target.id) return false;
-    if ((target.role === "admin" || target.role === "super_admin") && caller.role !== "super_admin") {
+    if ((isHeadmaster(target) || target.role === "super_admin") && caller.role !== "super_admin") {
         return false;
     }
     return true;
@@ -106,7 +116,15 @@ export const canDeleteUser = (
  */
 export async function canManageClass(caller: Caller, classId: number): Promise<boolean> {
     if (!caller.role) return false;
-    if (isAdmin(caller)) return true;
+    if (caller.role === "super_admin") return true;
+    const level = headmasterSchoolLevel(caller);
+    if (level) {
+        const [owned] = await db
+            .select({ id: classes.id })
+            .from(classes)
+            .where(and(eq(classes.id, classId), eq(classes.schoolLevel, level)));
+        return !!owned;
+    }
     if (!isTeacher(caller) || !caller.id) return false;
 
     const [owned] = await db
@@ -147,6 +165,15 @@ export async function anyChildEnrolledInClass(childIds: string[], classId: numbe
  */
 export async function canAccessStudent(caller: Caller, studentId: string): Promise<boolean> {
     if (!caller.role) return false;
+    const level = headmasterSchoolLevel(caller);
+    if (level) {
+        const [enrolled] = await db
+            .select({ studentId: enrollments.studentId })
+            .from(enrollments)
+            .innerJoin(classes, eq(enrollments.classId, classes.id))
+            .where(and(eq(enrollments.studentId, studentId), eq(classes.schoolLevel, level)));
+        return !!enrolled;
+    }
     if (isAdmin(caller)) return true;
     if (caller.id === studentId) return true;
 
@@ -167,7 +194,29 @@ export async function canAccessStudent(caller: Caller, studentId: string): Promi
         .where(eq(studentProfiles.userId, studentId));
     if (!profile) return false;
     if (profile.parentUserId && profile.parentUserId === caller.id) return true;
-    if (profile.parentEmail && caller.email && profile.parentEmail.toLowerCase() === caller.email.toLowerCase()) return true;
+    if (!profile.parentUserId && profile.parentEmail && caller.email && profile.parentEmail.toLowerCase() === caller.email.toLowerCase()) return true;
+    return false;
+}
+
+/** Whether a headmaster may manage a user's account in their school. */
+export async function canManageUser(caller: Caller, target: { id: string; role: UserRoles }): Promise<boolean> {
+    if (caller.role === "super_admin") return true;
+    const level = headmasterSchoolLevel(caller);
+    if (!level) return false;
+    if (target.role === "student") return canAccessStudent(caller, target.id);
+    if (target.role === "teacher") {
+        const [row] = await db.select({ id: classes.id }).from(classes)
+            .where(and(eq(classes.teacherId, target.id), eq(classes.schoolLevel, level)));
+        return !!row;
+    }
+    if (target.role === "parent") {
+        const [row] = await db.select({ userId: studentProfiles.userId })
+            .from(studentProfiles)
+            .innerJoin(enrollments, eq(enrollments.studentId, studentProfiles.userId))
+            .innerJoin(classes, eq(enrollments.classId, classes.id))
+            .where(and(eq(studentProfiles.parentUserId, target.id), eq(classes.schoolLevel, level)));
+        return !!row;
+    }
     return false;
 }
 
@@ -178,7 +227,7 @@ export async function canAccessStudent(caller: Caller, studentId: string): Promi
  */
 export async function getLinkedChildIds(caller: { id: string; email?: string | undefined }): Promise<string[]> {
     const conditions = [eq(studentProfiles.parentUserId, caller.id)];
-    if (caller.email) conditions.push(ilike(studentProfiles.parentEmail, caller.email));
+    if (caller.email) conditions.push(and(isNull(studentProfiles.parentUserId), ilike(studentProfiles.parentEmail, caller.email))!);
 
     const rows = await db
         .select({ userId: studentProfiles.userId })
@@ -200,5 +249,13 @@ export async function getLinkedChildIds(caller: { id: string; email?: string | u
  * route with `getLinkedChildIds` + `inArray`.
  */
 export function teacherClassScope(caller: Caller): SQL | undefined {
+    const level = headmasterSchoolLevel(caller);
+    if (level) return eq(classes.schoolLevel, level);
     return isTeacher(caller) && caller.id ? eq(classes.teacherId, caller.id) : undefined;
+}
+
+/** Scope a query that already joins classes to a headmaster's school. */
+export function headmasterClassScope(caller: Caller): SQL | undefined {
+    const level = headmasterSchoolLevel(caller);
+    return level ? eq(classes.schoolLevel, level) : undefined;
 }

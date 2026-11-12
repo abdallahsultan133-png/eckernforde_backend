@@ -1,15 +1,15 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
-import {and, desc, eq, getTableColumns, ilike, inArray, or, sql} from "drizzle-orm";
+import {and, desc, eq, exists, getTableColumns, ilike, inArray, or, sql} from "drizzle-orm";
 
-import {classes, departments, subjects} from "../db/schema/index.js";
+import {classes, departments, portalContexts, subjects} from "../db/schema/index.js";
 import { db } from "../db/index.js";
 import { requireAuth, requireRole, ADMIN_ROLES, STAFF_ROLES } from "../middleware/require-auth.js";
 import { validateBody } from "../middleware/validate.js";
 import { createSubjectSchema, updateSubjectSchema } from "../lib/schemas.js";
 import { logAction } from "./audit-logs.js";
 import * as policy from "../lib/policy.js";
-import { activePortalClassIds } from "../lib/portal-context.js";
+import { activePortalClassIds, currentAcademicYear } from "../lib/portal-context.js";
 
 const router = express.Router();
 
@@ -18,7 +18,7 @@ const generatedSubjectCode = () => `SUBJ-${randomUUID().replace(/-/g, "").slice(
 // Get all subjects with optional search, filtering and pagination
 router.get("/", requireAuth, async (req, res) => {
     try {
-        const { search, department, page = 1, limit = 10 } = req.query;
+        const { search, department, schoolLevel, academicYearId, stage, page = 1, limit = 10 } = req.query;
 
         const currentPage = Math.max(1, parseInt(String(page), 10) || 1);
         const limitPerPage = Math.min(Math.max(1, parseInt(String(limit), 10) || 10), 100); // Max 100 records per page
@@ -43,7 +43,57 @@ router.get("/", requireAuth, async (req, res) => {
             filterConditions.push(ilike(departments.name, deptPattern));
         }
 
+        const catalogClassConditions = [eq(classes.subjectId, subjects.id)];
+        if (schoolLevel !== undefined) {
+            const level = String(schoolLevel);
+            if (!['primary', 'secondary'].includes(level)) return res.status(400).json({ error: 'Invalid school level' });
+            const levelCondition = eq(classes.schoolLevel, level as 'primary' | 'secondary');
+            // Keep newly-created, not-yet-classified classes visible to admins
+            // while they are being assigned to a school level. The migration
+            // classifies the existing legacy catalogue, so this only covers
+            // the short window before an admin edits a new row.
+            catalogClassConditions.push(levelCondition);
+        }
+
+        if (academicYearId !== undefined) {
+            const yearId = Number(academicYearId);
+            if (!Number.isInteger(yearId) || yearId <= 0) return res.status(400).json({ error: 'Invalid academic year' });
+            catalogClassConditions.push(eq(classes.academicYearId, yearId));
+        }
+
+        if (stage !== undefined) {
+            const selectedStage = String(stage).trim().toLowerCase();
+            const stageParts = selectedStage.split("_");
+            const roman = stageParts.at(-1);
+            const patterns = selectedStage === "nursery"
+                ? ["nursery%"]
+                : selectedStage.startsWith("kindergarten_") && roman
+                    ? [`kg ${roman}%`, `kg_${roman}%`, `kindergarten ${roman}%`, `kindergarten_${roman}%`]
+                    : selectedStage.startsWith("standard_") && roman
+                        ? [`standard ${roman}%`, `standard_${roman}%`, `class ${roman}%`, `class_${roman}%`]
+                        : selectedStage.startsWith("form_") && roman
+                            ? [`form ${roman}%`, `form_${roman}%`]
+                            : [];
+            if (patterns.length === 0) return res.status(400).json({ error: "Invalid subject stage" });
+            catalogClassConditions.push(or(...patterns.map((pattern) => ilike(classes.name, pattern)))!);
+        }
+
+        if (schoolLevel !== undefined || academicYearId !== undefined) {
+            filterConditions.push(exists(
+                db.select({ id: classes.id })
+                    .from(classes)
+                    .where(and(...catalogClassConditions)),
+            ));
+        }
+
         const caller = req.user!;
+        const headmasterLevel = policy.headmasterSchoolLevel(caller);
+        if (headmasterLevel) {
+            filterConditions.push(or(
+                eq(subjects.createdBy, caller.id!),
+                exists(db.select({ id: classes.id }).from(classes).where(and(eq(classes.subjectId, subjects.id), eq(classes.schoolLevel, headmasterLevel))))
+            ));
+        }
         if ((policy.isTeacher(caller) || policy.isStudent(caller)) && caller.id) {
             const classIds = await activePortalClassIds({ ...caller, id: caller.id });
             if (classIds) {
@@ -52,12 +102,24 @@ router.get("/", requireAuth, async (req, res) => {
                     : [];
                 const subjectIds = [...new Set(rows.map((row) => row.subjectId))];
                 if (policy.isTeacher(caller)) {
-                    // A teacher must be able to see a subject immediately after
-                    // creating it, before it has been assigned to a class.
+                    // Once a teacher has selected a portal class/form, that
+                    // context is a hard boundary. Do not leak subjects from a
+                    // different form simply because the teacher created them.
+                    const year = await currentAcademicYear();
+                    const [context] = year && !caller.portalArchive
+                        ? await db.select({ stage: portalContexts.stage })
+                            .from(portalContexts)
+                            .where(and(eq(portalContexts.userId, caller.id), eq(portalContexts.academicYearId, year.id)))
+                        : [];
+                    const createdHere = year && context
+                        ? and(eq(subjects.createdBy, caller.id), eq(subjects.creationAcademicYearId, year.id), eq(subjects.creationStage, context.stage))
+                        : undefined;
                     filterConditions.push(
-                        subjectIds.length
-                            ? or(eq(subjects.createdBy, caller.id), inArray(subjects.id, subjectIds))
-                            : eq(subjects.createdBy, caller.id),
+                        context
+                            ? (subjectIds.length ? or(inArray(subjects.id, subjectIds), createdHere!) : createdHere!)
+                            : (subjectIds.length
+                                ? or(eq(subjects.createdBy, caller.id), inArray(subjects.id, subjectIds))
+                                : eq(subjects.createdBy, caller.id)),
                     );
                 } else {
                     filterConditions.push(subjectIds.length ? inArray(subjects.id, subjectIds) : sql`false`);
@@ -118,13 +180,37 @@ router.post("/", requireAuth, requireRole(...STAFF_ROLES), validateBody(createSu
         const { name, code, description, departmentId } = req.body as {
             name: string; code?: string; description?: string | null; departmentId: number;
         };
+        const subjectName = name.trim();
+        const caller = req.user!;
+        let creationAcademicYearId: number | null = null;
+        let creationStage: string | null = null;
+        if (policy.isTeacher(caller)) {
+            if (caller.portalArchive) return res.status(409).json({ error: "Previous academic years are read-only." });
+            const year = await currentAcademicYear();
+            if (!year) return res.status(409).json({ error: "No active academic year is configured." });
+            const [context] = await db.select({ stage: portalContexts.stage })
+                .from(portalContexts)
+                .where(and(eq(portalContexts.userId, caller.id!), eq(portalContexts.academicYearId, year.id)));
+            if (!context) return res.status(409).json({ error: "Select your class or form before creating a subject." });
+            creationAcademicYearId = year.id;
+            creationStage = context.stage;
+        }
+
+        const [existingSubject] = await db
+            .select({ id: subjects.id })
+            .from(subjects)
+            .where(sql`lower(${subjects.name}) = lower(${subjectName})`)
+            .limit(1);
+        if (existingSubject) {
+            return res.status(409).json({ error: "A subject with this name already exists." });
+        }
 
         const [created] = await db
             .insert(subjects)
-            .values({ name: name.trim(), code: code?.trim() || generatedSubjectCode(), description: description ?? null, departmentId, createdBy: req.user!.id! })
+            .values({ name: subjectName, code: code?.trim() || generatedSubjectCode(), description: description ?? null, departmentId, createdBy: caller.id!, creationAcademicYearId, creationStage })
             .returning();
 
-        await logAction({ req, action: "subject.create", resource: "subjects", resourceId: created?.id, details: `Created subject "${name.trim()}"` });
+        await logAction({ req, action: "subject.create", resource: "subjects", resourceId: created?.id, details: `Created subject "${subjectName}"` });
 
         res.status(201).json({ data: created });
     } catch (e) {

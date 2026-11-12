@@ -33,7 +33,7 @@ const policy = await import("./policy.js");
 
 const selectSpy = db.select as unknown as ReturnType<typeof vi.fn>;
 
-const ALL_ROLES = ["admin", "super_admin", "teacher", "student", "parent"] as const;
+const ALL_ROLES = ["primary_headmaster", "secondary_headmaster", "super_admin", "teacher", "student", "parent"] as const;
 
 beforeEach(() => {
     h.queryRows = [];
@@ -43,8 +43,8 @@ beforeEach(() => {
 // ── Role predicates ──────────────────────────────────────────────────────────
 describe("role predicates", () => {
     const cases: Array<[keyof typeof policy, string[]]> = [
-        ["isAdmin", ["admin", "super_admin"]],
-        ["isStaff", ["teacher", "admin", "super_admin"]],
+        ["isAdmin", ["primary_headmaster", "secondary_headmaster", "super_admin"]],
+        ["isStaff", ["teacher", "primary_headmaster", "secondary_headmaster", "super_admin"]],
         ["isTeacher", ["teacher"]],
         ["isStudent", ["student"]],
         ["isParent", ["parent"]],
@@ -67,12 +67,12 @@ describe("role predicates", () => {
 
 // ── Role groups ──────────────────────────────────────────────────────────────
 describe("role groups", () => {
-    it("ADMIN_ROLES is exactly admin + super_admin", () => {
-        expect([...policy.ADMIN_ROLES].sort()).toEqual(["admin", "super_admin"]);
+    it("ADMIN_ROLES is exactly both headmasters + super_admin", () => {
+        expect([...policy.ADMIN_ROLES].sort()).toEqual(["primary_headmaster", "secondary_headmaster", "super_admin"]);
     });
 
     it("STAFF_ROLES is ADMIN_ROLES plus teacher", () => {
-        expect([...policy.STAFF_ROLES].sort()).toEqual(["admin", "super_admin", "teacher"]);
+        expect([...policy.STAFF_ROLES].sort()).toEqual(["primary_headmaster", "secondary_headmaster", "super_admin", "teacher"]);
         for (const r of policy.ADMIN_ROLES) expect(policy.STAFF_ROLES).toContain(r);
     });
 
@@ -87,7 +87,7 @@ describe("role groups", () => {
 // ── ownsOrAdmin ──────────────────────────────────────────────────────────────
 describe("ownsOrAdmin", () => {
     it("any admin passes regardless of owner (including a null owner)", () => {
-        expect(policy.ownsOrAdmin({ id: "admin1", role: "admin" }, "someoneElse")).toBe(true);
+        expect(policy.ownsOrAdmin({ id: "hm1", role: "secondary_headmaster" }, "someoneElse")).toBe(true);
         expect(policy.ownsOrAdmin({ id: "sa1", role: "super_admin" }, null)).toBe(true);
     });
 
@@ -118,14 +118,15 @@ describe("canGrantRole", () => {
     });
 
     it("an admin may grant non-admin roles", () => {
-        expect(policy.canGrantRole({ role: "admin" }, "teacher")).toBe(true);
-        expect(policy.canGrantRole({ role: "admin" }, "student")).toBe(true);
-        expect(policy.canGrantRole({ role: "admin" }, "parent")).toBe(true);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "teacher")).toBe(true);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "student")).toBe(true);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "parent")).toBe(true);
     });
 
     it("an admin may NOT grant admin-level roles (no self-promotion path)", () => {
-        expect(policy.canGrantRole({ role: "admin" }, "admin")).toBe(false);
-        expect(policy.canGrantRole({ role: "admin" }, "super_admin")).toBe(false);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "primary_headmaster")).toBe(false);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "secondary_headmaster")).toBe(false);
+        expect(policy.canGrantRole({ role: "secondary_headmaster" }, "super_admin")).toBe(false);
     });
 
     it("non-admins may never grant any role", () => {
@@ -146,7 +147,7 @@ describe("teacherClassScope", () => {
 
     it("returns undefined for every other caller", () => {
         expect(policy.teacherClassScope({ role: "teacher" })).toBeUndefined(); // no id
-        expect(policy.teacherClassScope({ role: "admin", id: "a1" })).toBeUndefined();
+        expect(policy.teacherClassScope({ role: "secondary_headmaster", id: "a1" })).toBeDefined();
         expect(policy.teacherClassScope({ role: "super_admin", id: "a1" })).toBeUndefined();
         expect(policy.teacherClassScope({ role: "student", id: "s1" })).toBeUndefined();
         expect(policy.teacherClassScope({ role: "parent", id: "p1" })).toBeUndefined();
@@ -191,8 +192,7 @@ describe("canManageClass", () => {
         expect(selectSpy).not.toHaveBeenCalled();
     });
 
-    it("any admin is allowed without touching the DB", async () => {
-        expect(await policy.canManageClass({ role: "admin", id: "a1" }, 1)).toBe(true);
+    it("a super_admin is allowed without touching the DB", async () => {
         expect(await policy.canManageClass({ role: "super_admin", id: "a2" }, 1)).toBe(true);
         expect(selectSpy).not.toHaveBeenCalled();
     });
@@ -253,8 +253,7 @@ describe("canAccessStudent", () => {
         expect(selectSpy).not.toHaveBeenCalled();
     });
 
-    it("any admin is allowed without touching the DB", async () => {
-        expect(await policy.canAccessStudent({ role: "admin", id: "a1" }, "s1")).toBe(true);
+    it("a super_admin is allowed without touching the DB", async () => {
         expect(await policy.canAccessStudent({ role: "super_admin", id: "a2" }, "s1")).toBe(true);
         expect(selectSpy).not.toHaveBeenCalled();
     });
@@ -295,6 +294,11 @@ describe("canAccessStudent", () => {
         expect(
             await policy.canAccessStudent({ role: "parent", id: "p1", email: "mum@example.com" }, "s1"),
         ).toBe(false);
+    });
+
+    it("does not use a legacy email link when another parent owns the explicit link", async () => {
+        h.queryRows = [{ parentUserId: "someoneElse", parentEmail: "mum@example.com" }];
+        expect(await policy.canAccessStudent({ role: "parent", id: "p1", email: "mum@example.com" }, "s1")).toBe(false);
     });
 
     it("a parent is denied when the student has no profile row", async () => {

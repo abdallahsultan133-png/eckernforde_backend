@@ -1,5 +1,5 @@
 import express from "express";
-import { and, eq, gte, lte, or } from "drizzle-orm";
+import { and, eq, gte, ilike, isNull, lte, or } from "drizzle-orm";
 import { db } from "../db/index.js";
 import { academicYears, studentProfiles, classGrades, attendance, classes, enrollments, subjects, termSubjectResults } from "../db/schema/app.js";
 import { user } from "../db/schema/auth.js";
@@ -20,6 +20,48 @@ router.get("/me", requireAuth, async (req, res) => {
         res.json({ data: { ...me, profile: profile ?? null } });
     } catch (e) {
         res.status(500).json({ error: "Failed to load profile" });
+    }
+});
+
+router.get("/me/preferences", requireAuth, async (req, res) => {
+    try {
+        const [account] = await db.select({ preferences: user.notificationPreferences })
+            .from(user)
+            .where(eq(user.id, req.user!.id!));
+        if (!account) return res.status(404).json({ error: "User not found" });
+        res.json({ data: account.preferences ?? { inApp: true, email: true } });
+    } catch (e) {
+        console.error("GET /profile/me/preferences error:", e);
+        res.status(500).json({ error: "Failed to load notification preferences" });
+    }
+});
+
+router.patch("/me/preferences", requireAuth, async (req, res) => {
+    try {
+        const body = req.body as Record<string, unknown>;
+        if (!body || typeof body !== "object" || Array.isArray(body)) return res.status(400).json({ error: "Invalid preferences" });
+        const keys = Object.keys(body);
+        if (keys.length === 0 || keys.some((key) => key !== "inApp" && key !== "email") || keys.some((key) => typeof body[key] !== "boolean")) {
+            return res.status(400).json({ error: "Choose a valid notification preference." });
+        }
+
+        const [account] = await db.select({ preferences: user.notificationPreferences })
+            .from(user)
+            .where(eq(user.id, req.user!.id!));
+        if (!account) return res.status(404).json({ error: "User not found" });
+        const updatedPreferences = {
+            inApp: account.preferences?.inApp !== false,
+            email: account.preferences?.email !== false,
+            ...body,
+        } as { inApp: boolean; email: boolean };
+        const [updated] = await db.update(user)
+            .set({ notificationPreferences: updatedPreferences })
+            .where(eq(user.id, req.user!.id!))
+            .returning({ preferences: user.notificationPreferences });
+        res.json({ data: updated?.preferences ?? updatedPreferences });
+    } catch (e) {
+        console.error("PATCH /profile/me/preferences error:", e);
+        res.status(500).json({ error: "Failed to save notification preferences" });
     }
 });
 
@@ -119,6 +161,9 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
             .from(attendance).where(eq(attendance.studentId, studentId));
         const totalAtt = attendanceRows.length;
         const presentAtt = attendanceRows.filter((r) => r.status === "present").length;
+        const absentAtt = attendanceRows.filter((r) => r.status === "absent").length;
+        const lateAtt = attendanceRows.filter((r) => r.status === "late").length;
+        const excusedAtt = attendanceRows.filter((r) => r.status === "excused").length;
         const schoolBand = enrolledClasses.some((course) => course.schoolLevel === "secondary") || recordedLevels.some((row) => row.schoolLevel === "secondary")
             ? "secondary"
             : enrolledClasses.some((course) => course.schoolLevel === "primary" || course.schoolLevel === "nursery") || recordedLevels.some((row) => row.schoolLevel === "primary" || row.schoolLevel === "nursery")
@@ -135,7 +180,14 @@ router.get("/student/:studentId", requireAuth, async (req, res) => {
         res.json({
             data: {
                 ...studentUser, profile: profile ?? null, linkedParent, enrolledClasses, schoolBand, grades,
-                attendanceSummary: { total: totalAtt, present: presentAtt, rate: totalAtt > 0 ? Math.round((presentAtt / totalAtt) * 1000) / 10 : null },
+                attendanceSummary: {
+                    total: totalAtt,
+                    present: presentAtt,
+                    absent: absentAtt,
+                    late: lateAtt,
+                    excused: excusedAtt,
+                    rate: totalAtt > 0 ? Math.round((presentAtt / totalAtt) * 1000) / 10 : null,
+                },
             },
         });
     } catch (e) {
@@ -204,7 +256,7 @@ router.get("/my-children", requireAuth, async (req, res) => {
             .from(studentProfiles)
             .where(
                 parentEmail
-                    ? or(eq(studentProfiles.parentUserId, parentId), eq(studentProfiles.parentEmail, parentEmail.toLowerCase()))
+                    ? or(eq(studentProfiles.parentUserId, parentId), and(isNull(studentProfiles.parentUserId), ilike(studentProfiles.parentEmail, parentEmail)))
                     : eq(studentProfiles.parentUserId, parentId)
             );
         if (profiles.length === 0) return res.json({ data: [] });
@@ -214,7 +266,7 @@ router.get("/my-children", requireAuth, async (req, res) => {
                 .from(user).where(eq(user.id, childId));
             const [profile] = await db.select().from(studentProfiles).where(eq(studentProfiles.userId, childId));
             const enrolledClasses = await db
-                .select({ id: classes.id, name: classes.name, subject: { id: subjects.id, name: subjects.name } })
+                .select({ id: classes.id, name: classes.name, schoolLevel: classes.schoolLevel, subject: { id: subjects.id, name: subjects.name } })
                 .from(enrollments).innerJoin(classes, eq(enrollments.classId, classes.id)).leftJoin(subjects, eq(classes.subjectId, subjects.id))
                 .where(and(
                     eq(enrollments.studentId, childId),

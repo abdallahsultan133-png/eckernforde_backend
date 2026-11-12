@@ -41,7 +41,7 @@ export const updateSubjectSchema = createSubjectSchema.partial();
 
 export const createDepartmentSchema = z.object({
     name: z.string().trim().min(1, "name is required").max(255),
-    code: z.string().trim().min(1, "code is required").max(50),
+    code: z.string().trim().min(1, "code is required").max(50).optional(),
     description: z.string().max(255).optional().nullable(),
 });
 export const updateDepartmentSchema = createDepartmentSchema.partial();
@@ -211,7 +211,7 @@ export const sendMessageSchema = z.object({
 
 // ─── USERS / PROFILE ──────────────────────────────────────────────────────────
 export const updateRoleSchema = z.object({
-    role: z.enum(["student", "teacher", "admin", "parent", "super_admin"]),
+    role: z.enum(["student", "teacher", "primary_headmaster", "secondary_headmaster", "parent", "super_admin"]),
 });
 
 // Admin-initiated password reset. "email" mails the user a reset link (the same
@@ -219,6 +219,10 @@ export const updateRoleSchema = z.object({
 // the admin reads back once and hands to the user in person.
 export const adminResetPasswordSchema = z.object({
     mode: z.enum(["email", "temporary"]),
+});
+
+export const passwordResetRequestSchema = z.object({
+    email: z.string().trim().email(),
 });
 
 export const linkParentSchema = z.object({

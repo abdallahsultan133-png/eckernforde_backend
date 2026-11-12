@@ -1,10 +1,20 @@
 import 'dotenv/config';
-import { drizzle } from 'drizzle-orm/node-postgres';
+import dns from 'node:dns';
+import { drizzle } from 'drizzle-orm/neon-serverless';
 import { sql } from 'drizzle-orm';
-import pg from 'pg';
+import { neonConfig, Pool } from '@neondatabase/serverless';
+import ws from 'ws';
 import * as schema from './schema/index.js';
 
-const { Pool } = pg;
+// Neon exposes both IPv4 and IPv6 records. On hosts whose IPv6 route is
+// present but not usable, Node can spend the connection timeout on IPv6 before
+// trying IPv4 and report an otherwise misleading DNS/timeout failure.
+dns.setDefaultResultOrder(process.env.DB_IP_FAMILY === '6' ? 'ipv6first' : 'ipv4first');
+
+// Neon’s WebSocket pool avoids requiring a direct outbound TCP connection to
+// PostgreSQL port 5432, which was timing out during authentication. Node 24
+// provides WebSocket globally and is the runtime used by this project.
+neonConfig.webSocketConstructor = globalThis.WebSocket ?? ws;
 
 if (!process.env.DATABASE_URL) {
     throw new Error('DATABASE_URL is not defined');
@@ -50,11 +60,31 @@ export const pool = new Pool({
 const wait = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function isRetryableConnectionError(error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    // DNS lookups can briefly fail when a Neon compute wakes or the local
-    // network changes. Treat those transient resolver/socket failures like a
-    // dropped idle client, but only retry safe read-only queries below.
-    return /connection terminated|connection reset|socket hang up|ECONNRESET|EPIPE|EACCES|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|getaddrinfo/i.test(message);
+    // Drizzle wraps driver failures in DrizzleQueryError, so inspect the full
+    // cause chain instead of only the outer "Failed query" message. Neon can
+    // also reject a WebSocket connection with a bare ErrorEvent that has no
+    // message or error code; that event is still a transient connection error.
+    const pending: unknown[] = [error];
+    const seen = new Set<object>();
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (!current || (typeof current !== 'object' && typeof current !== 'function')) {
+            if (typeof current === 'string' && /connection terminated|connection reset|socket hang up|ECONNRESET|EPIPE|EACCES|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|getaddrinfo/i.test(current)) return true;
+            continue;
+        }
+        if (seen.has(current as object)) continue;
+        seen.add(current as object);
+        const details = current as { name?: unknown; message?: unknown; code?: unknown; type?: unknown; cause?: unknown; errors?: unknown; originalError?: unknown };
+        const message = [details.name, details.message, details.code, details.type]
+            .filter((value): value is string => typeof value === 'string')
+            .join(' ');
+        if (/connection terminated|connection reset|socket hang up|ECONNRESET|EPIPE|EACCES|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|getaddrinfo/i.test(message)
+            || (details.name === 'ErrorEvent' && details.type === 'error')) return true;
+        if (details.cause) pending.push(details.cause);
+        if (details.originalError) pending.push(details.originalError);
+        if (Array.isArray(details.errors)) pending.push(...details.errors);
+    }
+    return false;
 }
 
 function readOnlyQueryText(query: unknown) {
@@ -70,15 +100,16 @@ function readOnlyQueryText(query: unknown) {
 // dropped connection otherwise fails immediately. Retrying one read-only query
 // lets the pool acquire a fresh client without risking duplicate writes.
 const poolQuery = pool.query.bind(pool) as (...args: any[]) => Promise<any>;
+const readRetryAttempts = Math.max(1, Number(process.env.DB_READ_RETRY_ATTEMPTS ?? 5));
 pool.query = (async (...args: any[]) => {
     const readOnly = readOnlyQueryText(args[0]);
     for (let attempt = 0; ; attempt++) {
         try {
             return await poolQuery(...args);
         } catch (error) {
-            if (!readOnly || !isRetryableConnectionError(error) || attempt >= 3) throw error;
-            const backoffMs = 250 * (attempt + 1);
-            console.warn(`[DB] read query connection/DNS failure; retrying in ${backoffMs}ms (attempt ${attempt + 1}/3).`);
+            if (!readOnly || !isRetryableConnectionError(error) || attempt >= readRetryAttempts - 1) throw error;
+            const backoffMs = Math.min(4_000, 250 * (2 ** attempt));
+            console.warn(`[DB] read query connection/DNS failure; retrying in ${backoffMs}ms (attempt ${attempt + 1}/${readRetryAttempts}).`);
             await wait(backoffMs);
         }
     }
@@ -87,7 +118,7 @@ pool.query = (async (...args: any[]) => {
 // A dropped idle connection (Neon suspending a compute, a network blip) emits
 // 'error' on the pool. Without a listener, node treats it as unhandled and
 // crashes the process — the pool itself recovers on the next checkout.
-pool.on('error', (err) => {
+pool.on('error', (err: Error) => {
     console.error('[DB] idle pool client error (pool will recover):', err.message);
 });
 
